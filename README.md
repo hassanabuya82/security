@@ -91,6 +91,7 @@ Autoswagger automates the process of finding **OpenAPI/Swagger** specifications,
 | `-rate <N>`          | Throttles requests to N requests per second. Default is 30. Use 0 to disable rate limiting.                  |
 | `-b, --brute`        | Enables brute-forcing of parameter values (multiple test combos).                                            |
 | `-json`              | Outputs results in JSON format instead of a Rich table in default mode.                                      |
+| `-o, --output FILE`  | Also writes results and stats as JSON to FILE.                                                               |
 
 
 ## Help
@@ -106,7 +107,7 @@ Autoswagger automates the process of finding **OpenAPI/Swagger** specifications,
                               https://intruder.io
                           Find unauthenticated endpoints
 
-usage: autoswagger.py [-h] [-v] [-risk] [-all] [-product] [-stats] [-rate RATE] [-b] [-json] [urls ...]
+usage: autoswagger.py [-h] [-v] [-risk] [-all] [-product] [-stats] [-rate RATE] [-b] [-json] [-o FILE] [urls ...]
 
 Autoswagger: Detect unauthenticated access control issues via Swagger/OpenAPI documentation.
 
@@ -123,6 +124,7 @@ options:
   -rate RATE     Set the rate limit in requests per second (default: 30). Use 0 to disable rate limiting.
   -b, --brute    Enable exhaustive testing of parameter values.
   -json          Output results in JSON format in default mode.
+  -o, --output FILE  Also write results and stats as JSON to FILE.
 
 Example usage:
   python autoswagger.py https://api.example.com -v
@@ -158,7 +160,8 @@ Example usage:
    - Optionally builds request bodies from the spec’s `requestBody` (OpenAPI 3) or body parameters (Swagger 2).
 
 4. **Rate Limiting & Concurrency**  
-   - Supports threading with a cap on requests per second (`-rate`).  
+   - `-rate` caps the total requests per second across all threads.  
+   - 429/503 responses are retried after `Retry-After` (backing off every thread); 502/504 are retried for GET only.  
    - Each endpoint is tested in a dedicated job.
 
 5. **Response Analysis**  
@@ -175,7 +178,7 @@ Example usage:
 
 2. **Secrets & Debug Info**  
    - TruffleHog-like regex checks for API keys, tokens, environment variables.  
-   - Merges any matches into the PII data structure for final reporting.
+   - Secrets are reported separately from PII (`secrets_data`); stack traces and debug pages are reported as low-severity `debug_info`.
 
 3. **Large Response Check**  
    - Flags responses with 100+ JSON elements or large XML structures as “interesting.”  
@@ -185,16 +188,29 @@ Example usage:
 
 ## Output
 
-By default, output is shown in a table.
+By default, output is shown as one table per host, sorted by severity:
 
-- `-json` produces JSON objects, grouping results by endpoint.
-- `-product` filters down to only “interesting” endpoints (PII, large responses and responses with secrets).
+| Severity | Meaning |
+|----------|---------|
+| CRITICAL | A secret (API key, token, private key) is in the response, at any status code |
+| HIGH     | PII in a 2xx response |
+| MEDIUM   | A 2xx from an endpoint the spec says requires auth, or a large data dump (100+ records or >100 KB) |
+| LOW      | Stack trace or debug page |
+| INFO     | Responded, nothing notable found |
+
+The **Findings** column lists what was found, with counts and a masked sample (e.g. `PII: Email ×12 (j***@acme.io)`).
+
+Before testing, Autoswagger requests a random nonexistent path to learn what the server returns for unknown routes, and discards responses that match it (catch-all pages and SPA fallbacks that return 200 for every path).
+
+- `-json` produces JSON objects, grouping results by endpoint. Logs go to stderr, so `-json` output can be piped straight into tools like `jq`.
+- `-product` filters down to only “interesting” endpoints (PII, secrets, large responses and auth not enforced).
+- `-o FILE` additionally saves results and stats as JSON.
 
 ---
 
 ## Interpreting Results
 
-For most use cases, interpreting results involves looking at the output (endpoints resulting in Status Code 200s), and paying particular attention to endpoints which are marked as 'PII or Secret Detected'. These endpoints are the ones that contain impactful exposures, but they should be manually checked to confirm. You may also wish to look at other 200s that do not contain PII, and determine whether it's intended for these endpoints to be public or not.
+Start with CRITICAL and HIGH rows: these are responses that contained secrets or PII without authentication. "Auth not enforced" findings are endpoints the spec itself says need credentials, but which answered an unauthenticated request with a 2xx. These are strong candidates for broken access control. All findings should be manually checked to confirm. You may also wish to look at INFO rows and determine whether it's intended for these endpoints to be public or not.
 
 Simple GET endpoints can be triaged using command line tools like curl, but we would recommend using your usual API testing suite (tools such as Postman or Burp Suite) to replay requests and read responses to confirm whether an exposure is present.
 
@@ -204,7 +220,7 @@ Simple GET endpoints can be triaged using command line tools like curl, but we w
 
 - `-stats` appends or prints overall statistics, such as:
   - Hosts with valid specs
-  - Hosts with PII
+  - Hosts with PII, hosts with secrets
   - Total requests sent, average RPS
   - Percentage of endpoints responding with 2xx or 4xx
   - Shown in either a Rich table in default mode or embedded in JSON if `-json` or `-product` is used.

@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 # Autoswagger - Cale Anderson @ Intruder    
 import argparse
+import hashlib
 import json
+import math
 import os
 import re
 import sys
 import threading
 import time
-from itertools import product as itertools_product
-from urllib.parse import urljoin, urlencode, urlparse
+import uuid
+from itertools import islice, product as itertools_product
+from urllib.parse import quote, unquote, urljoin, urlencode, urlparse
 
 import requests
 import urllib3
@@ -16,7 +19,8 @@ from bs4 import BeautifulSoup
 from dicttoxml import dicttoxml
 import yaml
 import xml.etree.ElementTree as ET
-from datetime import datetime
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -25,6 +29,7 @@ from presidio_analyzer import AnalyzerEngine, RecognizerRegistry, Pattern, Patte
 
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
+from rich.markup import escape
 from rich.table import Table
 from rich.logging import RichHandler
 import logging
@@ -44,55 +49,55 @@ file_handler = None
 
 def setup_pii_recognizers():
     """
-    Adds custom recognizers for Person, Phone, Email, and Address to the Presidio registry
-    with context words. Each recognizer uses a pattern and context to detect potential PII.
+    Adds custom recognizers for Person, Phone, Email, and Address to the Presidio registry.
+    Base scores sit below PII_SCORE_THRESHOLD on purpose: a value only counts as PII
+    when the context boost from a matching field name (e.g. 'firstName') lifts it over.
+    Patterns are case-sensitive (Presidio's default is case-insensitive, which made
+    'not found' look like a person's name).
     """
-    # Person
-    person_pattern = Pattern(
-        name="person", 
-        regex=r"\b[A-Z][a-z]+\s[A-Z][a-z]+\b", 
-        score=0.85
-    )
+    flags = re.MULTILINE | re.DOTALL
+
+    # Person: "Jane Doe", "Mary-Ann O'Neil", or a single capitalized word for firstName/lastName fields
     person_recognizer = PatternRecognizer(
-        supported_entity="PERSON", 
-        patterns=[person_pattern],
-        context=["name","first_name","last_name","firstname","lastname"]
+        supported_entity="PERSON",
+        patterns=[
+            Pattern(name="full_name", regex=r"\b[A-Z][a-z'\-]+(?:\s[A-Z][a-z'\-]+){1,3}\b", score=0.4),
+            Pattern(name="single_name", regex=r"^[A-Z][a-z'\-]{1,30}$", score=0.3),
+        ],
+        context=["name", "firstname", "lastname", "fullname", "surname", "givenname", "familyname", "first", "last"],
+        global_regex_flags=flags
     )
 
     # Phone Number
-    phone_pattern = Pattern(
-        name="phone_number", 
-        regex=r"(\+?\d{1,3}[-.\s]?(\d{3})[-.\s]?(\d{3,4})[-.\s]?(\d{4}))", 
-        score=0.85
-    )
     phone_recognizer = PatternRecognizer(
-        supported_entity="PHONE_NUMBER", 
-        patterns=[phone_pattern],
-        context=["phone","mobile","telephone","tel","phone_number"]
+        supported_entity="PHONE_NUMBER",
+        patterns=[Pattern(name="phone_number", regex=r"(\+?\d{1,3}[-.\s]?\(?\d{2,4}\)?[-.\s]?\d{3,4}[-.\s]?\d{3,4})", score=0.4)],
+        context=["phone", "mobile", "telephone", "tel", "cell", "fax", "msisdn"],
+        global_regex_flags=flags
     )
 
     # Email Address
-    email_pattern = Pattern(
-        name="email", 
-        regex=r"([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)", 
-        score=0.85
-    )
     email_recognizer = PatternRecognizer(
-        supported_entity="EMAIL_ADDRESS", 
-        patterns=[email_pattern],
-        context=["email","email_address","contact"]
+        supported_entity="EMAIL_ADDRESS",
+        patterns=[Pattern(name="email", regex=r"([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)", score=0.5)],
+        context=["email", "mail"],
+        global_regex_flags=flags
     )
 
-    # Address
-    address_pattern = Pattern(
-        name="address", 
-        regex=r"\b\d{1,5}\s\w+\s\w+\b", 
-        score=0.85
-    )
+    # Address: a house number followed by a street suffix, or (weaker) number + words
     address_recognizer = PatternRecognizer(
-        supported_entity="ADDRESS", 
-        patterns=[address_pattern],
-        context=["addr","address","location"]
+        supported_entity="ADDRESS",
+        patterns=[
+            Pattern(
+                name="street_address",
+                regex=r"\b\d{1,5}[A-Za-z]?\s+(?:[A-Za-z0-9.'\-]+\s+){0,4}(?i:street|st|avenue|ave|road|rd|boulevard|blvd|lane|ln|drive|dr|court|ct|way|place|pl|terrace|close|crescent|square|sq|highway|hwy|parkway|pkwy)\b\.?",
+                score=0.5
+            ),
+            # Capitalized words only, so error text like "404 not found" doesn't qualify
+            Pattern(name="number_and_words", regex=r"\b\d{1,5}[A-Za-z]?\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b", score=0.3),
+        ],
+        context=["address", "addr", "street"],
+        global_regex_flags=flags
     )
 
     # Add each recognizer to the registry
@@ -119,13 +124,113 @@ analyzer = AnalyzerEngine(
 )
 
 # Initialize Rich Console for formatted output
-console = Console()
+# Logs, banner and progress go to stderr; results go to stdout, so
+# `autoswagger.py -json ... | jq` receives clean JSON
+console = Console(stderr=True)
+output_console = Console()
 
 # Suppress warnings about unverified HTTPS requests
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Default request timeout
 TIMEOUT = 10
+
+# Upper bound on value combinations tried per endpoint in brute mode
+MAX_BRUTE_COMBOS = 50
+
+# Finding severities, lowest to highest
+SEVERITY_RANK = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
+
+# Retries for throttled/unavailable responses, and the longest Retry-After we'll honor
+MAX_RETRIES = 3
+MAX_RETRY_DELAY = 60
+
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36"
+
+class RateLimiter:
+    """
+    A single limiter shared by every worker thread, so -rate caps the tool's total
+    request rate rather than each thread's. pause() pushes every thread back at once,
+    e.g. when the server answers 429.
+    """
+    def __init__(self, rate=30):
+        self.lock = threading.Lock()
+        self.next_time = 0.0
+        self.set_rate(rate)
+
+    def set_rate(self, rate):
+        self.interval = 1.0 / rate if rate and rate > 0 else 0.0
+
+    def wait(self):
+        with self.lock:
+            now = time.monotonic()
+            slot = max(now, self.next_time)
+            self.next_time = slot + self.interval
+        if slot > now:
+            time.sleep(slot - now)
+
+    def pause(self, seconds):
+        with self.lock:
+            self.next_time = max(self.next_time, time.monotonic() + seconds)
+
+rate_limiter = RateLimiter()
+request_count_lock = threading.Lock()
+thread_local = threading.local()
+
+def get_session():
+    """
+    Returns this thread's requests.Session (sessions aren't thread-safe, but
+    reusing one per thread keeps connections alive across requests).
+    """
+    session = getattr(thread_local, 'session', None)
+    if session is None:
+        session = requests.Session()
+        session.headers['User-Agent'] = USER_AGENT
+        session.verify = False
+        thread_local.session = session
+    return session
+
+def retry_after_seconds(response, attempt):
+    """
+    Returns how long to wait before retrying: the Retry-After header (seconds or
+    HTTP date) if present, otherwise exponential backoff. Capped at MAX_RETRY_DELAY.
+    """
+    header = response.headers.get('Retry-After', '').strip()
+    delay = None
+    if header.isdigit():
+        delay = int(header)
+    elif header:
+        try:
+            delay = (parsedate_to_datetime(header) - datetime.now(timezone.utc)).total_seconds()
+        except (TypeError, ValueError):
+            delay = None
+    if delay is None or delay < 0:
+        delay = 2 ** attempt
+    return min(delay, MAX_RETRY_DELAY)
+
+def http_request(method, url, **kwargs):
+    """
+    Sends a request through the shared rate limiter and this thread's session.
+    429 and 503 are retried for any method (the server didn't process them);
+    502 and 504 only for safe methods. Every attempt counts toward TOTAL_REQUESTS.
+    """
+    global TOTAL_REQUESTS
+    kwargs.setdefault('timeout', TIMEOUT)
+    safe_method = method.upper() in ('GET', 'HEAD', 'OPTIONS')
+
+    for attempt in range(MAX_RETRIES + 1):
+        rate_limiter.wait()
+        with request_count_lock:
+            TOTAL_REQUESTS += 1
+        response = get_session().request(method, url, **kwargs)
+
+        status = response.status_code
+        retryable = status in (429, 503) or (status in (502, 504) and safe_method)
+        if not retryable or attempt == MAX_RETRIES:
+            return response
+        # Slow every thread down, not just this one
+        rate_limiter.pause(retry_after_seconds(response, attempt))
+    return response
 
 # Paths for detecting swagger/openapi specs in UI or direct spec endpoints
 SWAGGER_UI_PATHS = sorted({
@@ -142,6 +247,7 @@ SWAGGER_UI_PATHS = sorted({
     "/api-docs/ui/", "/api-docs/v1/index.html", "/api-documentation/index.html",
     "/api/", "/api/api-docs", "/api/api-docs/index.html", "/api/api/",
     "/api/apidocs", "/api/config", "/api/doc", "/api/doc/", "/api/spec/", "/spec/",
+    "/swagger-ui/", "/swagger-ui/index.html",
 })
 
 DIRECT_SPEC_PATHS = sorted({
@@ -165,7 +271,12 @@ DIRECT_SPEC_PATHS = sorted({
     "/spec/swagger.yaml", "/spec/openapi.json", "/spec/openapi.yaml",
     "/api-docs/swagger-ui.json", "/api-docs/swagger-ui.yaml",
     "/api-docs/openapi.json", "/api-docs/openapi.yaml",
-    "/swagger-ui.json", "/swagger-ui.yaml"
+    "/swagger-ui.json", "/swagger-ui.yaml",
+    # Extensionless specs: Springfox (/v2/api-docs), springdoc (/v3/api-docs) and others
+    "/api-docs", "/v2/api-docs", "/v3/api-docs", "/api/v2/api-docs", "/api/v3/api-docs",
+    "/v3/api-docs/swagger-config", "/swagger-resources", "/openapi", "/api/openapi",
+    "/swagger/v2/swagger.json", "/api/v1/openapi.json", "/api/v1/swagger.json",
+    "/openapi/v1.json", "/api/docs/openapi.json"
 })
 
 # Regex patterns for secrets (similar to TruffleHog)
@@ -175,14 +286,15 @@ TRUFFLEHOG_REGEXES = {
     "SSH (DSA) private key": r"-----BEGIN DSA PRIVATE KEY-----",
     "SSH (EC) private key": r"-----BEGIN EC PRIVATE KEY-----",
     "PGP private key block": r"-----BEGIN PGP PRIVATE KEY BLOCK-----",
-    "AWS API Key": r"AKIA[0-9A-Z]{16}",
+    "AWS API Key": r"\bAKIA[0-9A-Z]{16}\b",
     "Amazon MWS Auth Token": r"amzn\.mws\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
     "AWS AppSync GraphQL Key": r"da2-[a-z0-9]{26}",
     "Facebook Access Token": r"EAACEdEose0cBA[0-9A-Za-z]+",
-    "Facebook OAuth": r"[fF][aA][cC][eE][bB][oO][oO][kK].*['\"]?[0-9a-f]{32}['\"]?",
-    "GitHub": r"[gG][iI][tT][hH][uU][bB].*['\"]?[0-9a-zA-Z]{35,40}['\"]?",
-    "Generic API Key": r"[aA][pP][iI]_?[kK][eE][yY].*['\"]?[0-9a-zA-Z]{32,45}['\"]?",
-    "Generic Secret": r"[sS][eE][cC][rR][eE][tT].*['\"]?[0-9a-zA-Z]{32,45}['\"]?",
+    "Facebook OAuth": r"(?i:facebook).{0,20}?['\"]([0-9a-f]{32})['\"]",
+    "GitHub": r"(?i:github).{0,20}?['\"]([0-9a-zA-Z]{35,40})['\"]",
+    "GitHub Token": r"\b(?:gh[pousr]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{82})\b",
+    "Generic API Key": r"(?i:api[_-]?key)['\"]?\s*[:=]\s*['\"]([0-9a-zA-Z\-_]{32,45})['\"]",
+    "Generic Secret": r"(?i:secret)['\"]?\s*[:=]\s*['\"]([0-9a-zA-Z\-_]{32,45})['\"]",
     "Google API Key": r"AIza[0-9A-Za-z\-_]{35}",
     "Google Cloud Platform OAuth": r"[0-9]+-[0-9A-Za-z_]{32}\.apps\.googleusercontent\.com",
     "MailChimp API Key": r"[0-9a-f]{32}-us[0-9]{1,2}",
@@ -195,17 +307,36 @@ TRUFFLEHOG_REGEXES = {
     "Stripe Restricted API Key": r"rk_live_[0-9a-zA-Z]{24}",
     "Square Access Token": r"sq0atp-[0-9A-Za-z\-_]{22}",
     "Square OAuth Secret": r"sq0csp-[0-9A-Za-z\-_]{43}",
-    "Telegram Bot API Key": r"[0-9]+:AA[0-9A-Za-z\-_]{33}",
-    "Twilio API Key": r"SK[0-9a-fA-F]{32}",
-    "Twitter Access Token": r"[tT][wW][iI][tT][tT][eE][rR].*[1-9][0-9]+-[0-9a-zA-Z]{40}",
-    "Twitter OAuth": r"[tT][wW][iI][tT][tT][eE][rR].*['\"]?[0-9a-zA-Z]{35,44}['\"]?"
+    "Telegram Bot API Key": r"\b[0-9]{8,10}:AA[0-9A-Za-z\-_]{33}\b",
+    "Twilio API Key": r"\bSK[0-9a-fA-F]{32}\b",
+    "Twitter Access Token": r"(?i:twitter).{0,20}?\b([1-9][0-9]+-[0-9a-zA-Z]{40})\b",
+    "Twitter OAuth": r"(?i:twitter).{0,20}?['\"]([0-9a-zA-Z]{35,44})['\"]"
 }
 
 # Compile the regexes for performance
 COMPILED_TRUFFLEHOG_REGEXES = {name: re.compile(pattern) for name, pattern in TRUFFLEHOG_REGEXES.items()}
 
-# Debug info regex pattern
-DEBUG_INFO_PATTERN = re.compile(r'\b(?:env\.[A-Za-z_]+|AWS_[A-Z_]+|AZURE_[A-Z_]+|DEBUG|ERROR)\b')
+# Patterns loose enough to also match placeholders or ordinary IDs; their matches
+# must look random (Shannon entropy per character) to count as a secret
+ENTROPY_CHECKED_SECRETS = {
+    "Facebook OAuth", "GitHub", "Generic API Key", "Generic Secret",
+    "Twilio API Key", "Twitter OAuth",
+}
+MIN_SECRET_ENTROPY = 3.0
+
+# Debug info patterns: concrete signs of stack traces, debug pages or leaked environment
+# config. Reported separately from secrets as a low-severity note. Bare words like
+# 'ERROR' or 'DEBUG' are deliberately not matched; they appear in ordinary error bodies.
+DEBUG_INFO_PATTERNS = {
+    "Python stack trace": r"Traceback \(most recent call last\)",
+    "Java stack trace": r"\bat [\w$.]+\([\w$]+\.java:\d+\)",
+    ".NET stack trace": r"\bat [\w.`<>]+\([^)\n]*\) in [^\n]+?:line \d+",
+    "Node.js stack trace": r"\bat [^\n()]+ \((?:/|[A-Za-z]:\\)[^)\n]+\.[cm]?js:\d+:\d+\)",
+    "PHP error": r"(?:Fatal error|Parse error|Warning)</b>?: .{0,200}? on line <b>?\d+",
+    "Framework debug page": r"Werkzeug Debugger|Whoops! There was an error|Django Version:|Laravel Debugbar",
+    "Environment variable dump": r"\b(?:AWS|AZURE)_[A-Z0-9_]{3,}[\"']?\s*[:=]",
+}
+COMPILED_DEBUG_INFO_PATTERNS = {name: re.compile(p) for name, p in DEBUG_INFO_PATTERNS.items()}
 
 # Default test values for parameters by type
 TEST_VALUES = {
@@ -288,25 +419,83 @@ def generate_parameter_values(param_type, enum=None):
         return enum
     return TEST_VALUES.get(param_type, TEST_VALUES["default"])
 
+def schema_example(schema):
+    """
+    Returns the example value declared by a schema or Swagger 2 parameter
+    ('example', OAS 3.1 'examples' list, 'x-example', then 'default'), or None.
+    """
+    if not isinstance(schema, dict):
+        return None
+    if schema.get('example') is not None:
+        return schema['example']
+    examples = schema.get('examples')
+    if isinstance(examples, list) and examples:
+        return examples[0]
+    if schema.get('x-example') is not None:
+        return schema['x-example']
+    return schema.get('default')
+
+def param_example(param):
+    """
+    Returns the example declared on an OpenAPI 3 parameter object itself
+    ('example', or the first entry of the 'examples' map), or None.
+    """
+    if param.get('example') is not None:
+        return param['example']
+    examples = param.get('examples')
+    if isinstance(examples, dict):
+        for ex in examples.values():
+            if isinstance(ex, dict) and ex.get('value') is not None:
+                return ex['value']
+    return None
+
+def param_schema(param):
+    """
+    Returns the schema describing a parameter's value. OpenAPI 3 nests it under
+    'schema'; Swagger 2 puts 'type', 'enum', 'default' etc. on the parameter itself.
+    """
+    schema = param.get('schema')
+    return schema if isinstance(schema, dict) else param
+
+def values_for_schema(schema, example=None):
+    """
+    Returns test values for a schema, with the spec's own example/default first
+    (a real-looking value is far more likely to return data than a generic one).
+    """
+    if example is None:
+        example = schema_example(schema)
+    values = generate_parameter_values(schema.get('type', 'string'), schema.get('enum'))
+    if example is None or isinstance(example, (dict, list)):
+        return values
+    return [example] + [v for v in values if v != example]
+
+def param_values(param):
+    """
+    Returns test values for a path/query parameter, using its declared examples first.
+    """
+    return values_for_schema(param_schema(param), param_example(param))
+
 def build_nested_object(schema, value_index=0):
     """
     Recursively constructs a nested object (dict) for complex schemas.
     Handles properties, arrays, and composite references (oneOf, anyOf, allOf).
+    Object or array properties with a declared example use that example as-is.
     """
     obj = {}
     for key, prop in schema.get('properties', {}).items():
         if '$ref' in prop:
             continue
-        if 'oneOf' in prop or 'anyOf' in prop or 'allOf' in prop:
+        example = schema_example(prop)
+        if isinstance(example, (dict, list)):
+            obj[key] = example
+        elif 'oneOf' in prop or 'anyOf' in prop or 'allOf' in prop:
             obj[key] = handle_composite_schemas(prop, value_index)
         elif prop.get('type') == 'object':
             obj[key] = build_nested_object(prop, value_index)
         elif prop.get('type') == 'array':
-            obj[key] = build_array_item(prop, value_index)
+            obj[key] = [build_array_item(prop.get('items', {}), value_index)]
         else:
-            param_type = prop.get('type', 'string')
-            enum = prop.get('enum', None)
-            values = generate_parameter_values(param_type, enum)
+            values = values_for_schema(prop)
             obj[key] = values[value_index % len(values)]
     return obj
 
@@ -332,12 +521,13 @@ def build_array_item(item_schema, value_index=0):
     If the schema is an object or contains properties, delegates to build_nested_object.
     Otherwise chooses from test values by type.
     """
+    example = schema_example(item_schema)
+    if isinstance(example, (dict, list)):
+        return example
     if 'properties' in item_schema or item_schema.get('type') == 'object':
         return build_nested_object(item_schema, value_index)
     else:
-        param_type = item_schema.get('type', 'string')
-        enum = item_schema.get('enum', None)
-        values = generate_parameter_values(param_type, enum)
+        values = values_for_schema(item_schema)
         return values[value_index % len(values)]
 
 def build_file_upload_body(schema, content_type, value_index=0):
@@ -357,7 +547,10 @@ def build_request_body(schema, content_type, value_index=0):
     if not schema:
         return None
 
-    if 'oneOf' in schema or 'anyOf' in schema or 'allOf' in schema:
+    example = schema_example(schema)
+    if isinstance(example, (dict, list)):
+        body = example
+    elif 'oneOf' in schema or 'anyOf' in schema or 'allOf' in schema:
         body = handle_composite_schemas(schema, value_index)
     elif schema.get('type') == 'array':
         item_schema = schema.get('items', {})
@@ -365,9 +558,7 @@ def build_request_body(schema, content_type, value_index=0):
     elif schema.get('type') == 'object':
         body = build_nested_object(schema, value_index)
     else:
-        param_type = schema.get('type', 'string')
-        enum = schema.get('enum', None)
-        values = generate_parameter_values(param_type, enum)
+        values = values_for_schema(schema)
         body = values[value_index % len(values)]
 
     if content_type == 'application/x-www-form-urlencoded':
@@ -409,149 +600,518 @@ def generate_query_string(parameters, value_mapping):
                 query_params[param_name] = value
     return urlencode(query_params)
 
+def shannon_entropy(value):
+    """
+    Returns the Shannon entropy of a string in bits per character
+    (random hex is ~4, random base62 ~5, 'xxxxxxxx' is 0).
+    """
+    if not value:
+        return 0.0
+    counts = {}
+    for ch in value:
+        counts[ch] = counts.get(ch, 0) + 1
+    length = len(value)
+    return -sum(c / length * math.log2(c / length) for c in counts.values())
+
 def detect_sensitive_info(content):
     """
-    Searches the response content for known secret patterns (TruffleHog) and debug info patterns.
+    Searches the response content for known secret patterns (TruffleHog).
     Returns a dict of matches if found, along with the regex patterns used.
     """
     sensitive_info = {}
     regex_patterns = {}
 
     for name, pattern in COMPILED_TRUFFLEHOG_REGEXES.items():
-        matches = pattern.findall(content)
+        matches = []
+        for m in pattern.finditer(content):
+            # Patterns with a capture group mark the token itself; record just that
+            value = m.group(1) if pattern.groups else m.group(0)
+            if name in ENTROPY_CHECKED_SECRETS and shannon_entropy(value) < MIN_SECRET_ENTROPY:
+                continue
+            if value not in matches:
+                matches.append(value)
         if matches:
             sensitive_info.setdefault(name, []).extend(matches)
             regex_patterns[name] = pattern.pattern
 
-    debug_info_found = DEBUG_INFO_PATTERN.findall(content)
-    if debug_info_found:
-        sensitive_info.setdefault('Debug Information', []).extend(debug_info_found)
-        regex_patterns['Debug Information'] = DEBUG_INFO_PATTERN.pattern
-
     return sensitive_info if sensitive_info else None, regex_patterns
 
-def is_large_response(content):
+def detect_debug_info(content):
     """
-    Checks if the response is large, specifically:
-    - Contains 100+ items in JSON arrays or dictionary keys
-    - Or 100+ elements in XML
-    - Or raw content_length > 100000 bytes
+    Searches the response content for stack traces, debug pages and environment dumps.
+    Returns {name: [up to 2 matched snippets]} or None.
     """
+    found = {}
+    for name, pattern in COMPILED_DEBUG_INFO_PATTERNS.items():
+        snippets = []
+        for match in pattern.finditer(content):
+            snippet = match.group(0).strip()
+            if snippet not in snippets:
+                snippets.append(snippet[:200])
+            if len(snippets) >= 2:
+                break
+        if snippets:
+            found[name] = snippets
+    return found or None
+
+PII_ENTITIES = ["PERSON", "EMAIL_ADDRESS", "PHONE_NUMBER", "ADDRESS"]
+
+# Presidio score a value must reach; only reachable with a field-name context boost
+PII_SCORE_THRESHOLD = 0.6
+
+# Caps the Presidio calls per response, so huge JSON bodies don't stall the scan
+MAX_PII_VALUES_PER_RESPONSE = 1000
+
+# Field-name tokens that point at each kind of PII. Matching is on whole tokens
+# ('hostName' -> ['host', 'name']), so 'hotel' no longer matches 'tel', etc.
+EMAIL_KEY_TOKENS = {"email", "mail", "emailaddress"}
+PHONE_KEY_TOKENS = {"phone", "mobile", "telephone", "tel", "cell", "cellphone", "fax", "msisdn", "phonenumber"}
+ADDRESS_KEY_TOKENS = {"address", "addr", "street", "streetaddress", "addressline"}
+# Tokens that make an 'address' field technical rather than postal
+NON_POSTAL_ADDRESS_TOKENS = {
+    "ip", "ipv4", "ipv6", "mac", "wallet", "server", "remote", "host", "bind", "listen",
+    "web", "url", "contract", "node", "peer", "proxy", "gateway", "local", "public",
+    "private", "network", "net", "broadcast", "memory", "base", "return", "bitcoin", "eth",
+}
+PERSON_KEYS = {
+    "firstname", "lastname", "fullname", "surname", "givenname", "familyname",
+    "middlename", "displayname", "forename", "maidenname",
+}
+PERSON_NAME_QUALIFIERS = {
+    "first", "last", "full", "given", "family", "middle", "display", "contact", "customer",
+    "owner", "person", "holder", "account", "patient", "employee", "member", "billing",
+    "shipping", "legal", "real", "sur", "fore",
+}
+
+def key_tokens(key):
+    """
+    Splits a field name into lowercase tokens: 'customerEmail' -> ['customer', 'email'],
+    'phone_number' -> ['phone', 'number'], 'Address-Line1' -> ['address', 'line1'].
+    """
+    spaced = re.sub(r'([a-z0-9])([A-Z])', r'\1 \2', str(key))
+    return [t for t in re.split(r'[^A-Za-z0-9]+', spaced.lower()) if t]
+
+def classify_pii_key(key):
+    """
+    Returns (entity_type, weak) for a field name that suggests PII, or (None, False).
+    A bare 'name' is weak: it is just as often a product or file name, so it only
+    counts when the same record also has an email/phone/address field.
+    """
+    tokens = key_tokens(key)
+    if not tokens:
+        return None, False
+    token_set = set(tokens)
+    compact = ''.join(tokens)
+
+    if token_set & EMAIL_KEY_TOKENS:
+        return "EMAIL_ADDRESS", False
+    if token_set & PHONE_KEY_TOKENS:
+        return "PHONE_NUMBER", False
+    if token_set & ADDRESS_KEY_TOKENS and not token_set & NON_POSTAL_ADDRESS_TOKENS:
+        return "ADDRESS", False
+    if compact in PERSON_KEYS or (
+            len(tokens) >= 2 and tokens[-1] == "name" and tokens[-2] in PERSON_NAME_QUALIFIERS):
+        return "PERSON", False
+    if compact == "name":
+        return "PERSON", True
+    return None, False
+
+def pii_keys_to_check(keys):
+    """
+    Maps each PII-suggestive key in one record (JSON object, CSV header or text body)
+    to its entity type, dropping weak keys when no strong PII key sits beside them.
+    """
+    classified = {k: classify_pii_key(k) for k in keys}
+    has_strong = any(entity and not weak for entity, weak in classified.values())
+    return {k: entity for k, (entity, weak) in classified.items() if entity and (has_strong or not weak)}
+
+def record_pii(text, entity, key, pii_data):
+    """
+    Runs Presidio on a single value, looking only for the entity its field name implies,
+    and merges any detections into pii_data.
+    """
+    tokens = key_tokens(key)
+    pres_res = analyzer.analyze(
+        text=text, entities=[entity], language='en',
+        context=tokens + [''.join(tokens)], score_threshold=PII_SCORE_THRESHOLD
+    )
+    for ent in pres_res:
+        value = text[ent.start:ent.end]
+        if entity == "PHONE_NUMBER" and not 7 <= sum(ch.isdigit() for ch in value) <= 15:
+            continue
+        pii_data.setdefault(ent.entity_type, {'values': set(), 'detection_methods': set()})
+        pii_data[ent.entity_type]['values'].add(value)
+        pii_data[ent.entity_type]['detection_methods'].add('context')
+
+def walk_json_for_pii(node, pii_data, budget, depth=0):
+    """
+    Recursively walks parsed JSON, analyzing scalar values whose key looks PII-related
+    (judged per object, so a bare 'name' counts only next to an email/phone/address field).
+    budget is a one-element list holding the remaining number of values to analyze.
+    """
+    if depth > 50 or budget[0] <= 0:
+        return
+    if isinstance(node, dict):
+        pii_keys = pii_keys_to_check(node.keys())
+        for key, value in node.items():
+            if budget[0] <= 0:
+                return
+            if isinstance(value, (dict, list)):
+                walk_json_for_pii(value, pii_data, budget, depth + 1)
+            elif isinstance(value, (str, int, float)) and not isinstance(value, bool) and key in pii_keys:
+                text = str(value).strip()
+                if text:
+                    budget[0] -= 1
+                    record_pii(text, pii_keys[key], key, pii_data)
+    elif isinstance(node, list):
+        for item in node:
+            if budget[0] <= 0:
+                return
+            if isinstance(item, (dict, list)):
+                walk_json_for_pii(item, pii_data, budget, depth + 1)
+
+def detect_pii(content_text):
+    """
+    Detects PII in a response body. JSON bodies are parsed and walked key by key,
+    so minified (single-line) JSON is fully covered. Other bodies fall back to
+    CSV-row and naive "key: value" line scanning.
+    Returns a dict of {entity_type: {'values': set, 'detection_methods': set}}.
+    """
+    pii_data = {}
+    budget = [MAX_PII_VALUES_PER_RESPONSE]
+
+    stripped = content_text.lstrip()
+    if stripped.startswith('{') or stripped.startswith('['):
+        try:
+            parsed = json.loads(content_text)
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, (dict, list)):
+            walk_json_for_pii(parsed, pii_data, budget)
+            return pii_data
+
+    lines = content_text.splitlines()
+
+    # Simple CSV detection: check first line for multiple commas
+    csv_header = []
+    if lines:
+        columns = lines[0].split(',')
+        if len(columns) >= 3:
+            csv_header = [col.strip().lower() for col in columns]
+
+    # If CSV header recognized, parse subsequent lines with the same number of columns
+    if csv_header:
+        csv_pii_keys = pii_keys_to_check(csv_header)
+        for line in lines[1:]:
+            row_cols = line.split(',')
+            if len(row_cols) != len(csv_header):
+                continue
+            for col_name, cell in zip(csv_header, row_cols):
+                if budget[0] <= 0:
+                    return pii_data
+                cell_value = cell.strip()
+                if cell_value and col_name in csv_pii_keys:
+                    budget[0] -= 1
+                    record_pii(cell_value, csv_pii_keys[col_name], col_name, pii_data)
+
+    # Also do a naive "key: value" detection line by line
+    pairs = []
+    for line in lines:
+        if ':' in line:
+            key_part, val_part = line.split(':', 1)
+            pairs.append((key_part.strip(), val_part.strip()))
+    line_pii_keys = pii_keys_to_check(k for k, _ in pairs)
+    for key_part, val_part in pairs:
+        if budget[0] <= 0:
+            break
+        if val_part and key_part in line_pii_keys:
+            budget[0] -= 1
+            record_pii(val_part, line_pii_keys[key_part], key_part, pii_data)
+
+    return pii_data
+
+# Thresholds for flagging a response as a large data exposure
+LARGE_RESPONSE_ITEMS = 100
+LARGE_RESPONSE_BYTES = 100000
+
+def count_response_items(content):
+    """
+    Returns how many records a response holds: the length of the largest JSON array
+    within the top two levels (so {"data": [...]} counts its list), the key count of a
+    flat JSON object, or the element count of an XML document. 0 if not parseable.
+    """
+    stripped = content.strip()
     try:
-        if isinstance(content, bytes):
-            content = content.decode('utf-8', errors='ignore')
-        if content.strip().startswith('{') or content.strip().startswith('['):
-            data = json.loads(content)
-            if isinstance(data, list) and len(data) >= 100:
-                return True
-            elif isinstance(data, dict):
-                total_items = sum(1 for _ in data.values())
-                if total_items >= 100:
-                    return True
-        elif content.strip().startswith('<'):
-            root = ET.fromstring(content)
-            total_elements = sum(1 for _ in root.iter())
-            if total_elements >= 100:
-                return True
-    except (json.JSONDecodeError, ET.ParseError):
+        if stripped.startswith('{') or stripped.startswith('['):
+            data = json.loads(stripped)
+            if isinstance(data, list):
+                return len(data)
+            if isinstance(data, dict):
+                nested = [len(v) for v in data.values() if isinstance(v, list)]
+                return max(nested + [len(data)])
+        elif stripped.startswith('<'):
+            return sum(1 for _ in ET.fromstring(stripped).iter())
+    except (ValueError, ET.ParseError):
         pass
+    return 0
+
+PII_LABELS = {"PERSON": "Name", "EMAIL_ADDRESS": "Email", "PHONE_NUMBER": "Phone", "ADDRESS": "Address"}
+
+def redact(value):
+    """
+    Masks a sample for display: 'jane@acme.io' -> 'j***@acme.io', 'AKIA1234ABCD' -> 'AK***CD'.
+    """
+    value = str(value)
+    if '@' in value:
+        local, _, domain = value.partition('@')
+        return f"{local[:1]}***@{domain}"
+    if len(value) <= 4:
+        return f"{value[:1]}***"
+    keep = 2 if len(value) < 16 else 4
+    return f"{value[:keep]}***{value[-keep:]}"
+
+def assess_findings(status_code, pii_data, secrets, debug_info, is_large, item_count, content_length):
+    """
+    Builds human-readable findings and the overall severity of a response:
+    critical = secret, high = PII, medium = large data dump, low = debug info, info = none.
+    Secrets and debug output count at any status; PII and size only on a 2xx.
+    """
+    findings = []
+    severity = "info"
+    ok = 200 <= status_code < 300
+
+    def raise_to(level):
+        nonlocal severity
+        if SEVERITY_RANK[level] > SEVERITY_RANK[severity]:
+            severity = level
+
+    for name, values in (secrets or {}).items():
+        unique = list(dict.fromkeys(values))
+        findings.append(f"Secret: {name} ×{len(unique)} ({redact(unique[0])})")
+        raise_to("critical")
+    if ok:
+        for entity, data in (pii_data or {}).items():
+            values = sorted(data['values'])
+            findings.append(f"PII: {PII_LABELS.get(entity, entity)} ×{len(values)} ({redact(values[0])})")
+            raise_to("high")
+        if is_large:
+            size = f"{item_count:,} items" if item_count >= LARGE_RESPONSE_ITEMS else f"{content_length:,} bytes"
+            findings.append(f"Large response: {size}")
+            raise_to("medium")
+    for name in (debug_info or {}):
+        findings.append(f"Debug info: {name}")
+        raise_to("low")
+    return severity, findings
+
+def body_fingerprint(content, requested_path):
+    """
+    Hashes a response body after removing the requested path from it, so catch-all
+    pages that echo the URL ("Cannot GET /foo") still hash the same for every path.
+    """
+    text = content.decode('utf-8', errors='ignore') if isinstance(content, bytes) else content
+    if requested_path and requested_path != '/':
+        text = text.replace(requested_path, '').replace(quote(requested_path), '')
+    return hashlib.sha1(text.encode('utf-8', errors='ignore')).hexdigest()
+
+def short_content_type(response):
+    """
+    Returns the bare media type of a response, e.g. 'application/json'.
+    """
+    return response.headers.get('Content-Type', '').split(';')[0].strip().lower()
+
+def take_baselines(base_url, base_path, methods, verbose=False):
+    """
+    Requests random, certainly-nonexistent paths (under the base path and at the root)
+    to learn what this server returns for unknown routes. SPAs and catch-all routes
+    answer these with a 200, which would otherwise make every endpoint look exposed.
+    Returns a list of {'method', 'status_code', 'content_type', 'content_length', 'body_hash'}.
+    """
+    parsed = urlparse(base_url)
+    root = f"{parsed.scheme}://{parsed.netloc}"
+    prefixes = {'', base_path.rstrip('/')}
+
+    baselines = []
+    for method in sorted(methods):
+        for prefix in sorted(prefixes):
+            path = f"{prefix}/autoswagger-{uuid.uuid4().hex[:12]}"
+            try:
+                resp = http_request(method, root + path, allow_redirects=False)
+            except requests.exceptions.RequestException as e:
+                if verbose:
+                    log(f"Baseline request {method} {root + path} failed: {e}", level="DEBUG")
+                continue
+            baselines.append({
+                'method': method,
+                'status_code': resp.status_code,
+                'content_type': short_content_type(resp),
+                'content_length': len(resp.content),
+                'body_hash': body_fingerprint(resp.content, path),
+            })
+            if verbose:
+                log(f"Baseline {method} {path}: {resp.status_code}, {len(resp.content)} bytes", level="DEBUG")
+    return baselines
+
+def matches_baseline(result, baselines):
+    """
+    Returns True if a result looks like the server's response to an unknown route:
+    same status and identical (path-normalized) body, or, for HTML pages whose markup
+    may carry per-request nonces, the same status and a near-identical length.
+    """
+    for b in baselines:
+        if b['method'] != result['method'] or b['status_code'] != result['status_code']:
+            continue
+        if b['body_hash'] == result['_body_hash']:
+            return True
+        if ('html' in b['content_type'] and 'html' in result['content_type']
+                and abs(b['content_length'] - result['content_length']) <= max(64, b['content_length'] * 0.02)):
+            return True
     return False
 
-def test_parameter_values(method, base_url_no_path, full_path, parameters, request_body, content_type, rate, include_all, verbose, brute=False):
+def declared_response_types(spec, details):
+    """
+    Returns the media types an operation says it responds with: OpenAPI 3
+    'responses.*.content' keys, or Swagger 2 'produces' (operation or global).
+    """
+    types = set()
+    for resp in (details.get('responses') or {}).values():
+        if isinstance(resp, dict):
+            types.update(k.lower() for k in (resp.get('content') or {}))
+    produces = details.get('produces') or spec.get('produces') or []
+    types.update(p.lower() for p in produces if isinstance(p, str))
+    return types
+
+def required_auth_schemes(spec, details):
+    """
+    Returns the security schemes the spec says an operation requires (e.g.
+    ['bearerAuth']), or [] if it is public. The operation's 'security' overrides the
+    global one; an empty requirement ({}) in the list means auth is optional.
+    """
+    security = details.get('security', spec.get('security'))
+    if not isinstance(security, list) or not security:
+        return []
+    if any(not req for req in security):
+        return []
+    schemes = []
+    for req in security:
+        if isinstance(req, dict):
+            schemes.extend(name for name in req if name not in schemes)
+    return schemes
+
+def apply_auth_finding(result, auth_schemes):
+    """
+    Records what the spec declares about auth on a result, and flags a 2xx from an
+    endpoint the spec says requires auth: the unauthenticated request should have
+    been refused, so access control is likely not enforced.
+    """
+    result['auth_required_by_spec'] = auth_schemes
+    if auth_schemes and 200 <= result['status_code'] < 300:
+        result['findings'].insert(0, f"Auth not enforced: spec requires {', '.join(auth_schemes)}")
+        if SEVERITY_RANK[result['severity']] < SEVERITY_RANK['medium']:
+            result['severity'] = 'medium'
+        result['interesting_response'] = True
+
+def false_positive_reason(result, baselines, expected_types):
+    """
+    Explains why a 2xx result is not a real exposure (None if it looks genuine):
+    it matches the unknown-route baseline, or it's an HTML page from an endpoint
+    whose spec only declares non-HTML responses (typically an SPA fallback page).
+    """
+    if not 200 <= result['status_code'] < 300:
+        return None
+    if matches_baseline(result, baselines):
+        return "matches the response for a random nonexistent path"
+    if ('html' in result['content_type'] and expected_types
+            and not any('html' in t or t == '*/*' for t in expected_types)):
+        return "returned HTML but the spec declares " + ", ".join(sorted(expected_types))
+    return None
+
+def test_parameter_values(method, base_url_no_path, full_path, parameters, request_body, content_type, include_all, verbose, brute=False):
     """
     Tests parameter values for a given method/endpoint.
     If brute is false, only a single default set is tested.
-    If brute is true, tries enumerating multiple data types/values.
+    If brute is true, tries up to MAX_BRUTE_COMBOS value combinations (spec examples
+    first) and returns the best response, preferring 2xx over 4xx/5xx.
     """
-    best_response = None
     value_mapping = {}
 
     # Collect a default mapping from the parameter schema
     for param in parameters:
         if param.get('in') not in ['path', 'query']:
             continue
-        param_name = param.get('name')
-        schema = param.get('schema', {})
-        param_type = schema.get('type', 'string')
-        enum = schema.get('enum', None)
-        values = generate_parameter_values(param_type, enum)
-        value_mapping[param_name] = values[0]
+        value_mapping[param.get('name')] = param_values(param)[0]
 
     # Default mode: one request
     if not brute:
         response = send_request(
             method, base_url_no_path, full_path, parameters,
-            value_mapping, request_body, content_type, rate, include_all, verbose
+            value_mapping, request_body, content_type, include_all, verbose
         )
         return [response] if response else []
 
-    # Brute mode: enumerates multiple combos or data types
-    else:
-        tested_types = set()
-        param_types = []
-        for param in parameters:
-            if param.get('in') not in ['path', 'query']:
-                continue
-            schema = param.get('schema', {})
-            param_type = schema.get('type', None)
-            enum = schema.get('enum', None)
-            if param_type:
-                values = generate_parameter_values(param_type, enum)
-            else:
-                values = []
-            param_types.append((param_type, values))
-
-        # If all parameters have known values
-        if all(vals for _, vals in param_types):
-            param_test_values = [vals for _, vals in param_types]
-            combos = itertools_product(*param_test_values)
-            for combo in combos:
-                val_map = {n: v for n, v in zip(value_mapping.keys(), combo)}
-                resp = send_request(
-                    method, base_url_no_path, full_path, parameters,
-                    val_map, request_body, content_type, rate, include_all, verbose
-                )
-                if resp:
-                    return [resp]
+    # Brute mode: try value combinations and keep the best response. A 4xx is not a
+    # success; keep going until a 2xx turns up (or the combination budget runs out).
+    names = []
+    candidates = []
+    all_typed = True
+    for param in parameters:
+        if param.get('in') not in ['path', 'query']:
+            continue
+        schema = param_schema(param)
+        names.append(param.get('name'))
+        # Treat the parameter as typed if the spec gives a type, enum or example
+        if schema.get('type') or schema.get('enum') or param_example(param) is not None or schema_example(schema) is not None:
+            candidates.append(param_values(param))
         else:
-            # Try different fallback types
+            # Unknown type: try values of every basic type
+            all_typed = False
+            fallback = []
             for test_type in ['integer', 'string', 'boolean', 'number']:
-                if test_type in tested_types:
-                    continue
-                tested_types.add(test_type)
-                param_test_values = [generate_parameter_values(test_type) for _ in value_mapping.keys()]
-                first_combos = itertools_product(*[vals[:1] for vals in param_test_values])
-                for combo in first_combos:
-                    val_map = {n: v for n, v in zip(value_mapping.keys(), combo)}
-                    resp = send_request(
-                        method, base_url_no_path, full_path, parameters,
-                        val_map, request_body, content_type, rate, include_all, verbose
-                    )
-                    if resp:
-                        max_clen = resp['content_length']
-                        best_response = resp
-                        second_combos = itertools_product(*param_test_values)
-                        for combo2 in second_combos:
-                            val_map2 = {n: v2 for n, v2 in zip(value_mapping.keys(), combo2)}
-                            resp2 = send_request(
-                                method, base_url_no_path, full_path, parameters,
-                                val_map2, request_body, content_type, rate, include_all, verbose
-                            )
-                            if resp2 and resp2['content_length'] > max_clen:
-                                max_clen = resp2['content_length']
-                                best_response = resp2
-                        return [best_response]
-    return []
+                fallback.extend(v for v in generate_parameter_values(test_type) if v not in fallback)
+            candidates.append(fallback)
 
-def send_request(method, base_url_no_path, full_path, parameters, value_mapping, request_body, content_type, rate, include_all, verbose):
+    best_response = None
+    for combo in islice(itertools_product(*candidates), MAX_BRUTE_COMBOS):
+        resp = send_request(
+            method, base_url_no_path, full_path, parameters,
+            dict(zip(names, combo)), request_body, content_type, include_all, verbose
+        )
+        if resp and (best_response is None or response_rank(resp) > response_rank(best_response)):
+            best_response = resp
+        # With known types the first 2xx is good enough; with guessed types keep
+        # looking for the combination that returns the most data
+        if all_typed and best_response and 200 <= best_response['status_code'] < 300:
+            break
+    return [best_response] if best_response else []
+
+SEVERITY_STYLES = {
+    "critical": "bold white on red", "high": "bold red", "medium": "yellow",
+    "low": "cyan", "info": "dim",
+}
+
+def sort_results(results):
     """
-    Sends a request to the computed endpoint, respecting rate limit.
+    Orders results most severe first, then by response size.
+    """
+    return sorted(results, key=lambda r: (-SEVERITY_RANK[r['severity']], -r['content_length']))
+
+def response_rank(result):
+    """
+    Orders results for picking the best one per endpoint: a 2xx beats anything else,
+    then higher severity, then a larger body.
+    """
+    return (
+        200 <= result['status_code'] < 300,
+        SEVERITY_RANK.get(result.get('severity'), 0),
+        result['content_length'],
+    )
+
+def send_request(method, base_url_no_path, full_path, parameters, value_mapping, request_body, content_type, include_all, verbose):
+    """
+    Sends a request to the computed endpoint through the shared rate limiter.
     Decodes the response, checks for secrets, PII (via line-based CSV and key:value scanning),
     returns a dictionary summarizing the result (status code, content length, PII, etc.)
     Skips 401 and 403 responses by default.
     """
-    global TOTAL_REQUESTS
-
     substituted_path = substitute_path_parameters(full_path, parameters, value_mapping)
     query_string = generate_query_string(parameters, value_mapping)
 
@@ -571,13 +1131,8 @@ def send_request(method, base_url_no_path, full_path, parameters, value_mapping,
     data = request_body if method.upper() in ['POST', 'PUT', 'PATCH'] else None
 
     try:
-        if rate > 0:
-            time.sleep(1.0 / rate)  # Rate limiting
-        TOTAL_REQUESTS += 1
-
-        response = requests.request(
-            method, full_url, headers=headers, data=data,
-            verify=False, allow_redirects=False, timeout=TIMEOUT
+        response = http_request(
+            method, full_url, headers=headers, data=data, allow_redirects=False
         )
         status_code = response.status_code
 
@@ -596,73 +1151,16 @@ def send_request(method, base_url_no_path, full_path, parameters, value_mapping,
         # Detect secrets in entire content
         sensitive_info, regex_patterns = detect_sensitive_info(content_text)
 
-        lines = content_text.splitlines()
-        pii_detected = False
-        pii_data = {}
-        pii_detection_methods = set()
+        pii_data = detect_pii(content_text)
+        pii_detected = bool(pii_data)
         interesting_response = False
+        item_count = count_response_items(content_text)
+        is_large = item_count >= LARGE_RESPONSE_ITEMS or content_length > LARGE_RESPONSE_BYTES
+        debug_info = detect_debug_info(content_text)
 
-        context_keywords = ["name", "email", "phone", "addr", "tel", "contact", "location"]
-
-        # Simple CSV detection: check first line for multiple commas
-        csv_header = []
-        if len(lines) > 0:
-            first_line = lines[0]
-            columns = first_line.split(',')
-            if len(columns) >= 3:
-                csv_header = [col.strip().lower() for col in columns]
-
-        # If CSV header recognized, parse subsequent lines with the same number of columns
-        if csv_header:
-            for idx, line in enumerate(lines):
-                if idx == 0:
-                    continue
-                row_cols = line.split(',')
-                if len(row_cols) == len(csv_header):
-                    for i, col_name in enumerate(csv_header):
-                        for kw in context_keywords:
-                            if kw in col_name:
-                                cell_value = row_cols[i].strip()
-                                pres_res = analyzer.analyze(
-                                    text=cell_value,
-                                    entities=["PERSON","EMAIL_ADDRESS","PHONE_NUMBER","ADDRESS"],
-                                    language='en'
-                                )
-                                if pres_res:
-                                    pii_detected = True
-                                    for ent in pres_res:
-                                        entity_type = ent.entity_type
-                                        entity_value = cell_value[ent.start:ent.end]
-                                        detection_method = 'context'
-                                        pii_data.setdefault(entity_type, {'values': set(), 'detection_methods': set()})
-                                        pii_data[entity_type]['values'].add(entity_value)
-                                        pii_data[entity_type]['detection_methods'].add(detection_method)
-                                        pii_detection_methods.add(detection_method)
-
-        # Also do a naive "key: value" detection line by line
-        for line in lines:
-            if ':' in line:
-                parts = line.split(':', 1)
-                key_part = parts[0].strip().lower()
-                val_part = parts[1].strip()
-
-                for kw in context_keywords:
-                    if kw in key_part:
-                        pres_res = analyzer.analyze(
-                            text=val_part,
-                            entities=["PERSON","EMAIL_ADDRESS","PHONE_NUMBER","ADDRESS"],
-                            language='en'
-                        )
-                        if pres_res:
-                            pii_detected = True
-                            for ent in pres_res:
-                                entity_type = ent.entity_type
-                                entity_value = val_part[ent.start:ent.end]
-                                detection_method = 'context'
-                                pii_data.setdefault(entity_type, {'values': set(), 'detection_methods': set()})
-                                pii_data[entity_type]['values'].add(entity_value)
-                                pii_data[entity_type]['detection_methods'].add(detection_method)
-                                pii_detection_methods.add(detection_method)
+        # Readable findings (counts + one redacted sample) and an overall severity
+        severity, findings = assess_findings(status_code, pii_data, sensitive_info, debug_info,
+                                             is_large, item_count, content_length)
 
         if pii_data:
             for entity_type in pii_data:
@@ -671,7 +1169,7 @@ def send_request(method, base_url_no_path, full_path, parameters, value_mapping,
 
         # Mark interesting if 200 (or 404 if include_all) plus big or has PII
         if status_code == 200 or (include_all and status_code == 404):
-            if is_large_response(response.content) or content_length > 100000:
+            if is_large:
                 interesting_response = True
             if pii_detected:
                 interesting_response = True
@@ -682,12 +1180,22 @@ def send_request(method, base_url_no_path, full_path, parameters, value_mapping,
             "path_template": full_path,
             "body": data if data else "",
             "status_code": status_code,
+            "content_type": short_content_type(response),
             "content_length": content_length,
+            "item_count": item_count,
+            "severity": severity,
+            "findings": findings,
+            # Internal: used to compare against the unknown-route baseline, removed before output
+            "_body_hash": body_fingerprint(response.content, urlparse(full_url).path),
             "pii_detected": pii_detected,
             "pii_data": None,
             "pii_detection_details": None,
+            "secrets_detected": False,
+            "secrets_data": None,
             "interesting_response": interesting_response,
-            "regex_patterns_found": {}
+            "regex_patterns_found": {},
+            # Low-severity note: stack traces / debug pages; not a secret, not PII
+            "debug_info": debug_info
         }
 
         if pii_detected:
@@ -699,27 +1207,11 @@ def send_request(method, base_url_no_path, full_path, parameters, value_mapping,
                 }
             result["pii_detection_details"] = detection_details
 
-        # If TruffleHog found sensitive_info, merge that with the same pii_data structure
+        # Secrets are reported in their own fields, separate from PII
         if sensitive_info:
-            result["regex_patterns_found"] = {}
-            result["pii_detected"] = True
-            for key, values in sensitive_info.items():
-                detection_method = 'regex'
-                if key not in pii_data:
-                    pii_data[key] = {'values': set(), 'detection_methods': set()}
-                pii_data[key]['values'].update(values)
-                pii_data[key]['detection_methods'].add(detection_method)
-                pii_detection_methods.add(detection_method)
-                result["regex_patterns_found"][key] = regex_patterns[key]
-
-            result["pii_data"] = {k: list(vv['values'])[:2] for k, vv in pii_data.items()}
-            detection_details = {}
-            for k, vv in pii_data.items():
-                detection_details[k] = {
-                    "detection_methods": list(vv['detection_methods'])
-                }
-            result["pii_detection_details"] = detection_details
-            result["pii_detected"] = True
+            result["secrets_detected"] = True
+            result["secrets_data"] = {k: list(dict.fromkeys(v))[:2] for k, v in sensitive_info.items()}
+            result["regex_patterns_found"] = {k: regex_patterns[k] for k in sensitive_info}
             if (status_code == 200 or (include_all and status_code == 404)):
                 interesting_response = True
             result["interesting_response"] = interesting_response
@@ -742,7 +1234,7 @@ def send_request(method, base_url_no_path, full_path, parameters, value_mapping,
     return None
 
 def test_endpoint(base_url, base_path, path_template, method, parameters, request_body=None,
-                  content_type=None, verbose=False, rate=30, include_all=False,
+                  content_type=None, verbose=False, include_all=False,
                   product_mode=False, brute=False):
     """
     Tests a single endpoint (method + path_template).
@@ -763,7 +1255,7 @@ def test_endpoint(base_url, base_path, path_template, method, parameters, reques
         start_time = time.time()
         endpoint_results = test_parameter_values(
             method, base_url_no_path, full_path, parameters,
-            request_body, content_type, rate, include_all, verbose, brute=brute
+            request_body, content_type, include_all, verbose, brute=brute
         )
         if endpoint_results:
             results.extend(endpoint_results)
@@ -777,9 +1269,20 @@ def test_endpoint(base_url, base_path, path_template, method, parameters, reques
 
     return results
 
+def merge_parameters(path_params, op_params):
+    """
+    Combines path-level parameters (shared by every method on a path) with the
+    operation's own. An operation parameter overrides a path one with the same name and location.
+    """
+    merged = {}
+    for param in (path_params or []) + (op_params or []):
+        if isinstance(param, dict):
+            merged[(param.get('name'), param.get('in'))] = param
+    return list(merged.values())
+
 def test_endpoints(base_url, base_path, swagger_spec, verbose=False,
                    include_risk=False, include_all=False, product_mode=False,
-                   rate=30, tried_basepath_fallback=False, brute=False):
+                   tried_basepath_fallback=False, brute=False):
     """
     Iterates over all paths and methods in the provided swagger_spec.
     Submits tasks to test_endpoint if the method is allowed (GET or others if -risk).
@@ -791,9 +1294,18 @@ def test_endpoints(base_url, base_path, swagger_spec, verbose=False,
             log("Specification does not contain 'paths' key.", level="CRITICAL")
         return results
 
+    # Inline $ref pointers once; the basepath fallback re-enters with the resolved spec
+    if not tried_basepath_fallback:
+        swagger_spec = resolve_refs(swagger_spec)
+
     unique_endpoints = set()
     all_results = []
     max_workers = min(100, os.cpu_count() * 5)
+
+    # Learn what unknown routes look like, so catch-all 200s can be discarded
+    methods_to_test = {'GET'} | ({'POST', 'PUT', 'PATCH', 'DELETE'} if include_risk else set())
+    baselines = take_baselines(base_url, base_path, methods_to_test, verbose)
+    filtered_count = 0
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_endpoint = {}
@@ -810,8 +1322,10 @@ def test_endpoints(base_url, base_path, swagger_spec, verbose=False,
                 if endpoint_key in unique_endpoints:
                     continue
                 unique_endpoints.add(endpoint_key)
+                expected_types = declared_response_types(swagger_spec, details)
+                auth_schemes = required_auth_schemes(swagger_spec, details)
 
-                parameters = details.get('parameters', [])
+                parameters = merge_parameters(methods.get('parameters', []), details.get('parameters', []))
                 content_types = ['application/json']
                 schema = None
 
@@ -822,16 +1336,21 @@ def test_endpoints(base_url, base_path, swagger_spec, verbose=False,
                         continue
                     content_types = list(rb_content.keys())
                     for ct in content_types:
-                        schema = rb_content[ct].get('schema', {})
+                        media = rb_content[ct] or {}
+                        schema = media.get('schema', {})
+                        # A media-level example overrides the schema's own
+                        media_example = param_example(media)
+                        if media_example is not None:
+                            schema = {**schema, 'example': media_example}
                         request_body = build_request_body(schema, ct)
                         fut = executor.submit(
                             test_endpoint,
                             base_url, base_path, path, mthd,
                             parameters, request_body, ct,
-                            verbose, rate, include_all,
+                            verbose, include_all,
                             product_mode=product_mode, brute=brute
                         )
-                        future_to_endpoint[fut] = (mthd, path, ct)
+                        future_to_endpoint[fut] = (mthd, path, ct, expected_types, auth_schemes)
                 else:
                     # Swagger 2.0 with parameters
                     if parameters:
@@ -844,17 +1363,23 @@ def test_endpoints(base_url, base_path, swagger_spec, verbose=False,
                         test_endpoint,
                         base_url, base_path, path, mthd,
                         parameters, request_body, 'application/json',
-                        verbose, rate, include_all,
+                        verbose, include_all,
                         product_mode=product_mode, brute=brute
                     )
-                    future_to_endpoint[fut] = (mthd, path, 'application/json')
+                    future_to_endpoint[fut] = (mthd, path, 'application/json', expected_types, auth_schemes)
 
         for future in as_completed(future_to_endpoint):
-            mthd, pth, ct = future_to_endpoint[future]
+            mthd, pth, ct, expected_types, auth_schemes = future_to_endpoint[future]
             try:
-                endpoint_results = future.result()
-                if endpoint_results:
-                    all_results.extend(endpoint_results)
+                for res in future.result() or []:
+                    reason = false_positive_reason(res, baselines, expected_types)
+                    if reason:
+                        filtered_count += 1
+                        if verbose:
+                            log(f"Discarding {res['method']} {res['url']}: {reason}", level="DEBUG")
+                        continue
+                    apply_auth_finding(res, auth_schemes)
+                    all_results.append(res)
             except Exception as exc:
                 if verbose:
                     log(f"Endpoint {mthd.upper()} {pth} with content type {ct} generated an exception: {exc}", level="DEBUG")
@@ -873,45 +1398,152 @@ def test_endpoints(base_url, base_path, swagger_spec, verbose=False,
                 fallback = test_endpoints(
                     base_url, '/', swagger_spec, verbose,
                     include_risk, include_all, product_mode=product_mode,
-                    rate=rate, tried_basepath_fallback=True, brute=brute
+                    tried_basepath_fallback=True, brute=brute
                 )
                 return fallback
 
+    if filtered_count and not product_mode:
+        log(f"Discarded {filtered_count} catch-all/soft-404 response(s) for {base_url}.", level="INFO")
+    for res in all_results:
+        res.pop('_body_hash', None)
     return all_results
 
-def fetch_swagger_spec(url, verbose=False):
+def resolve_refs(spec):
+    """
+    Returns a copy of the spec with local $ref pointers (e.g. '#/components/schemas/User',
+    '#/definitions/User', '#/components/parameters/id') replaced by their targets.
+    Sibling keys next to a $ref are merged over the target. Circular references are
+    cut off with an empty schema, and external or broken refs are left untouched.
+    """
+    cache = {}
+
+    def lookup(ref):
+        node = spec
+        for part in ref[2:].split('/'):
+            part = unquote(part).replace('~1', '/').replace('~0', '~')
+            if isinstance(node, dict) and part in node:
+                node = node[part]
+            elif isinstance(node, list) and part.isdigit() and int(part) < len(node):
+                node = node[int(part)]
+            else:
+                return None
+        return node
+
+    def resolve(node, stack):
+        if isinstance(node, list):
+            return [resolve(item, stack) for item in node]
+        if not isinstance(node, dict):
+            return node
+
+        ref = node.get('$ref')
+        if not (isinstance(ref, str) and ref.startswith('#/')):
+            return {k: resolve(v, stack) for k, v in node.items()}
+        if ref in stack:
+            return {}
+        if ref not in cache:
+            target = lookup(ref)
+            if target is None:
+                return {k: resolve(v, stack) for k, v in node.items()}
+            cache[ref] = resolve(target, stack | {ref})
+
+        resolved = cache[ref]
+        siblings = {k: resolve(v, stack) for k, v in node.items() if k != '$ref'}
+        if siblings and isinstance(resolved, dict):
+            return {**resolved, **siblings}
+        return resolved
+
+    return resolve(spec, frozenset())
+
+def is_valid_spec(spec):
+    """
+    Returns True if a parsed document looks like a Swagger 2 / OpenAPI 3 spec.
+    """
+    return (
+        isinstance(spec, dict)
+        and ('swagger' in spec or 'openapi' in spec)
+        and isinstance(spec.get('paths'), dict)
+    )
+
+def parse_spec_text(text):
+    """
+    Parses a response body as JSON, falling back to YAML. Returns None for HTML
+    or anything that doesn't parse into a dict/list.
+    """
+    stripped = text.lstrip('﻿ \t\r\n')
+    if not stripped or stripped.startswith('<'):
+        return None
+    try:
+        return json.loads(stripped)
+    except ValueError:
+        pass
+    try:
+        doc = yaml.safe_load(stripped)
+    except yaml.YAMLError:
+        return None
+    return doc if isinstance(doc, (dict, list)) else None
+
+def spec_config_urls(doc):
+    """
+    Returns spec URLs listed by a Swagger UI config document rather than a spec:
+    springdoc '/v3/api-docs/swagger-config' ({"url": ...} or {"urls": [{"url": ...}]})
+    and Springfox '/swagger-resources' ([{"location": ...}, ...]).
+    """
+    entries = []
+    if isinstance(doc, dict):
+        if isinstance(doc.get('url'), str):
+            entries.append(doc['url'])
+        entries.extend(doc.get('urls') or [])
+    elif isinstance(doc, list):
+        entries = doc
+    urls = []
+    for entry in entries:
+        if isinstance(entry, str):
+            urls.append(entry)
+        elif isinstance(entry, dict):
+            target = entry.get('url') or entry.get('location')
+            if isinstance(target, str):
+                urls.append(target)
+    return urls
+
+def fetch_swagger_spec(url, verbose=False, _depth=0):
     """
     Attempts to fetch and parse an OpenAPI/Swagger spec from a given URL.
-    Checks if response code is 200, content is JSON/YAML, and contains 'swagger'/'openapi'.
+    The body is parsed as JSON or YAML whatever the Content-Type says, and accepted
+    only if it is a real spec (has 'swagger'/'openapi' and a 'paths' object).
+    Swagger UI config documents that point at specs are followed (one level deep).
     Returns the parsed spec as a dictionary or None if unsuccessful.
     """
     if verbose:
         log(f"Fetching Swagger/OpenAPI spec directly from {url}", level="DEBUG")
     try:
-        resp = requests.get(url, verify=False, timeout=TIMEOUT)
-        ctype = resp.headers.get('Content-Type', '').lower()
-        if resp.status_code == 200 and any(x in ctype for x in ['json','yaml','text/plain']):
-            if 'swagger' in resp.text.lower() or 'openapi' in resp.text.lower():
-                try:
-                    if 'json' in ctype:
-                        spec = resp.json()
-                    else:
-                        spec = yaml.safe_load(resp.text)
-                    if verbose:
-                        log("Successfully loaded spec.", level="SUCCESS")
-                    return spec
-                except (json.JSONDecodeError, yaml.YAMLError) as perr:
-                    if verbose:
-                        log(f"Error decoding spec from {url}: {perr}", level="DEBUG")
-                        log(f"Failed to parse spec from {url}", level="DEBUG")
-        else:
-            if verbose:
-                log(f"Invalid response from {url}: {resp.status_code}, Content-Type: {ctype}", level="WARNING")
-                log(f"Failed to parse spec from {url}", level="DEBUG")
+        resp = http_request('GET', url)
     except requests.exceptions.RequestException as e:
         if verbose:
             log(f"Error fetching Swagger/OpenAPI spec from {url}: {e}", level="DEBUG")
-            log(f"Failed to parse spec from {url}", level="DEBUG")
+        return None
+
+    if resp.status_code != 200:
+        if verbose:
+            log(f"Invalid response from {url}: {resp.status_code}", level="DEBUG")
+        return None
+
+    doc = parse_spec_text(resp.text)
+    if is_valid_spec(doc):
+        if verbose:
+            log(f"Successfully loaded spec from {url}", level="SUCCESS")
+        return doc
+
+    if _depth == 0:
+        for config_url in spec_config_urls(doc):
+            spec_url = urljoin(url, config_url)
+            if verbose:
+                log(f"Following spec URL from Swagger UI config: {spec_url}", level="DEBUG")
+            spec = fetch_swagger_spec(spec_url, verbose, _depth=1)
+            if spec:
+                return spec
+
+    if verbose:
+        log(f"No valid spec at {url}", level="DEBUG")
     return None
 
 def find_swagger_ui_docs(base_url, verbose=False):
@@ -925,7 +1557,7 @@ def find_swagger_ui_docs(base_url, verbose=False):
         if verbose:
             log(f"Checking Swagger UI page at {swagger_ui_url}", level="DEBUG")
         try:
-            r = requests.get(swagger_ui_url, verify=False, allow_redirects=False, timeout=TIMEOUT)
+            r = http_request('GET', swagger_ui_url, allow_redirects=False)
             if r.status_code == 200 and ('swagger' in r.text.lower() or 'openapi' in r.text.lower()):
                 if verbose:
                     log(f"Swagger UI found at {swagger_ui_url}", level="DEBUG")
@@ -934,27 +1566,25 @@ def find_swagger_ui_docs(base_url, verbose=False):
                     full_spec_url = urljoin(swagger_ui_url, spec_url)
                     if verbose:
                         log(f"Found Swagger spec URL in HTML: {full_spec_url}", level="DEBUG")
-                    if any(full_spec_url.lower().endswith(ext) for ext in ['.json', '.yaml', '.yml']):
+                    # Spec URLs often have no extension (e.g. /v3/api-docs), so try anything that isn't JS
+                    if not urlparse(full_spec_url).path.lower().endswith('.js'):
                         sp = fetch_swagger_spec(full_spec_url, verbose)
                         if sp:
                             return sp
                     else:
-                        if verbose:
-                            log(f"Spec URL does not have a valid spec extension: {full_spec_url}", level="DEBUG")
-                        if full_spec_url.lower().endswith('.js'):
-                            try:
-                                js_r = requests.get(full_spec_url, verify=False, timeout=TIMEOUT)
-                                if js_r.status_code == 200:
-                                    if verbose:
-                                        log(f"Attempting to extract embedded spec from JS file: {full_spec_url}", level="DEBUG")
-                                    emb = extract_spec_from_js(js_r.text)
-                                    if emb and isinstance(emb, dict):
-                                        if verbose:
-                                            log(f"Extracted embedded Swagger spec from JS file: {full_spec_url}", level="DEBUG")
-                                        return emb
-                            except requests.exceptions.RequestException as e:
+                        try:
+                            js_r = http_request('GET', full_spec_url)
+                            if js_r.status_code == 200:
                                 if verbose:
-                                    log(f"Error fetching JS file {full_spec_url}: {e}", level="DEBUG")
+                                    log(f"Attempting to extract embedded spec from JS file: {full_spec_url}", level="DEBUG")
+                                emb = extract_spec_from_js(js_r.text)
+                                if emb and isinstance(emb, dict):
+                                    if verbose:
+                                        log(f"Extracted embedded Swagger spec from JS file: {full_spec_url}", level="DEBUG")
+                                    return emb
+                        except requests.exceptions.RequestException as e:
+                            if verbose:
+                                log(f"Error fetching JS file {full_spec_url}: {e}", level="DEBUG")
                 js_files = re.findall(r'<script\s+src=["\']([^"\']+\.js)["\']', r.text, re.IGNORECASE)
                 if verbose:
                     log(f"Found {len(js_files)} JavaScript files to analyze.", level="DEBUG")
@@ -967,21 +1597,21 @@ def find_swagger_ui_docs(base_url, verbose=False):
                     if verbose:
                         log(f"Fetching JS file: {jsu}", level="DEBUG")
                     try:
-                        js_resp = requests.get(jsu, verify=False, timeout=TIMEOUT)
+                        js_resp = http_request('GET', jsu)
                         if js_resp.status_code == 200:
                             spec_url_js = extract_spec_url_from_js(js_resp.text)
                             if spec_url_js:
                                 full_spec_url_js = urljoin(jsu, spec_url_js)
                                 if verbose:
                                     log(f"Found Swagger spec URL in JS: {full_spec_url_js}", level="DEBUG")
-                                if any(full_spec_url_js.lower().endswith(ext) for ext in ['.json', '.yaml', '.yml']):
+                                if not urlparse(full_spec_url_js).path.lower().endswith('.js'):
                                     sp2 = fetch_swagger_spec(full_spec_url_js, verbose)
                                     if sp2:
                                         return sp2
                                 else:
                                     if full_spec_url_js.lower().endswith('.js'):
                                         try:
-                                            nested_js = requests.get(full_spec_url_js, verify=False, timeout=TIMEOUT)
+                                            nested_js = http_request('GET', full_spec_url_js)
                                             if nested_js.status_code == 200:
                                                 emb2 = extract_spec_from_js(nested_js.text)
                                                 if emb2 and isinstance(emb2, dict):
@@ -1046,6 +1676,9 @@ def extract_spec_url_from_html(html_text):
     matches = re.findall(r'SwaggerUIBundle\s*\(\s*{\s*url:\s*"(.*?)"', html_text, re.DOTALL)
     if matches:
         return matches[0]
+    matches = re.findall(r'configUrl:\s*["\'](.*?)["\']', html_text)
+    if matches:
+        return matches[0]
     soup = BeautifulSoup(html_text, 'html.parser')
     for script in soup.find_all('script'):
         sc = script.string
@@ -1063,9 +1696,11 @@ def extract_spec_url_from_js(js_text):
     patterns = [
         r'url:\s*["\'](.*?)["\']',
         r'urls:\s*\[\s*{\s*url:\s*["\'](.*?)["\']',
-        r'const\s+\w+\s*=\s*["\'](.*?)["\']',
+        r'configUrl:\s*["\'](.*?)["\']',
         r'defaultDefinitionUrl\s*=\s*["\'](.*?)["\']',
         r'definitionURL\s*=\s*["\'](.*?)["\']',
+        # Last resort: a string constant that looks like a spec location
+        r'const\s+\w+\s*=\s*["\']([^"\']*(?:swagger|openapi|api-docs)[^"\']*)["\']',
     ]
     for pat in patterns:
         matches = re.findall(pat, js_text)
@@ -1080,7 +1715,8 @@ def extract_spec_from_js(js_text):
     to parse them as JSON after minor adjustments.
     """
     js_text = re.sub(r'/\*[\s\S]*?\*/', '', js_text)
-    js_text = re.sub(r'//.*', '', js_text)
+    # Skip '//' preceded by ':' so URLs like "https://..." inside the spec survive
+    js_text = re.sub(r'(?<!:)//.*', '', js_text)
 
     patterns = [
         r'(?:var|let|const)\s+(\w+)\s*=\s*({[\s\S]*?});',
@@ -1093,7 +1729,9 @@ def extract_spec_from_js(js_text):
             if cleaned_str:
                 try:
                     spec = json.loads(cleaned_str)
-                    return spec
+                    # Any parseable object isn't enough; it must actually be a spec
+                    if is_valid_spec(spec):
+                        return spec
                 except json.JSONDecodeError:
                     continue
     return None
@@ -1112,6 +1750,75 @@ def js_object_to_json(js_object_str):
     except Exception:
         return None
 
+def expand_server_url(server):
+    """
+    Substitutes OpenAPI 3 server variables (e.g. '{scheme}://{host}/v{version}')
+    with their default (or first enum) values. Returns None if any stay unresolved.
+    """
+    url = server.get('url')
+    if not isinstance(url, str):
+        return None
+    for name, var in (server.get('variables') or {}).items():
+        if not isinstance(var, dict):
+            continue
+        value = var.get('default')
+        if value is None and var.get('enum'):
+            value = var['enum'][0]
+        if value is not None:
+            url = url.replace('{' + name + '}', str(value))
+    if re.search(r'{[^}]*}', url):
+        return None
+    return url
+
+def normalize_base_path(path):
+    """
+    Turns '', 'v1', './v1/' etc. into a clean absolute path like '/v1' (or '/').
+    """
+    path = (path or '').strip()
+    while path.startswith('./'):
+        path = path[2:]
+    path = '/' + path.lstrip('/')
+    return path.rstrip('/') or '/'
+
+def determine_base_path(spec, base_url, verbose=False):
+    """
+    Works out the path prefix to put in front of every spec path.
+    OpenAPI 3 'servers' URLs may be absolute (https://api.x.com/v1), templated
+    ({scheme}://{host}/v1) or relative (/v1); only their path is used, since the
+    scan always targets the host the user supplied. A server on that same host is
+    preferred, then a relative one, then the first absolute one.
+    Swagger 2 uses 'basePath'.
+    """
+    target_host = urlparse(base_url).netloc.lower()
+    servers = spec.get('servers')
+
+    if isinstance(servers, list) and servers:
+        same_host, relative, other_host = [], [], []
+        for server in servers:
+            if not isinstance(server, dict):
+                continue
+            url = expand_server_url(server)
+            if url is None:
+                continue
+            parsed = urlparse(url)
+            if parsed.netloc:
+                (same_host if parsed.netloc.lower() == target_host else other_host).append(parsed)
+            else:
+                relative.append(parsed)
+
+        for group in (same_host, relative, other_host):
+            if group:
+                chosen = group[0]
+                if group is other_host and verbose:
+                    log(f"Spec declares server {chosen.scheme}://{chosen.netloc}; "
+                        f"scanning {target_host} with path {chosen.path or '/'}", level="DEBUG")
+                return normalize_base_path(chosen.path)
+        return '/'
+
+    if verbose and spec.get('host') and spec['host'].lower() != target_host:
+        log(f"Spec declares host {spec['host']}; scanning {target_host} instead", level="DEBUG")
+    return normalize_base_path(spec.get('basePath', '/'))
+
 def process_input(urls):
     """
     Ensures each URL has a valid scheme (http or https).
@@ -1125,7 +1832,7 @@ def process_input(urls):
         processed.append(url)
     return processed
 
-def main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rate, brute, json_output):
+def main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rate, brute, json_output, output_file=None):
     """
     Main function controlling flow:
     1. Tracks start time
@@ -1136,6 +1843,7 @@ def main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rat
     """
     global SCAN_START_TIME, SCAN_END_TIME, TOTAL_REQUESTS
     SCAN_START_TIME = time.time()  # Start the timer
+    rate_limiter.set_rate(rate)
 
     all_results = []
     processed_urls = process_input(urls)
@@ -1147,10 +1855,33 @@ def main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rat
         "hosts_with_valid_spec": 0,
         "hosts_with_valid_endpoint": 0,
         "hosts_with_pii": 0,
+        "hosts_with_secrets": 0,
         "pii_detection_methods": set(),
         "percentage_hosts_with_endpoint": 0,
         "regexes_found": set()
     }
+
+    def record_host_results(rslts):
+        """
+        Adds one host's results to the overall list and updates the per-host stats.
+        Each host is counted once, however many of its endpoints have findings.
+        """
+        with results_lock:
+            all_results.extend(rslts)
+            if not rslts:
+                return
+            stats["hosts_with_valid_endpoint"] += 1
+            pii_results = [rr for rr in rslts if rr['pii_detected']]
+            secret_results = [rr for rr in rslts if rr['secrets_detected']]
+            if pii_results:
+                stats["hosts_with_pii"] += 1
+            if secret_results:
+                stats["hosts_with_secrets"] += 1
+            for rr in pii_results:
+                for details in (rr['pii_detection_details'] or {}).values():
+                    stats["pii_detection_methods"].update(details['detection_methods'])
+            for rr in secret_results:
+                stats["regexes_found"].update(rr['regex_patterns_found'])
 
     def process_url(base_url):
         """
@@ -1165,38 +1896,31 @@ def main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rat
         with lock:
             stats["active_hosts"] += 1
 
-        # Check if the URL might be a direct spec (ends with .json/.yaml/.yml)
-        if any(base_url.lower().endswith(ext) for ext in ['.json', '.yaml', '.yml']):
+        # Check if the URL might be a direct spec: it ends with .json/.yaml/.yml, or it
+        # has a path (e.g. /v3/api-docs) that serves a spec without an extension
+        has_spec_ext = any(base_url.lower().endswith(ext) for ext in ['.json', '.yaml', '.yml'])
+        direct_spec = None
+        if not has_spec_ext and parsed_input_url.path.strip('/'):
+            direct_spec = fetch_swagger_spec(base_url, verbose)
+        if has_spec_ext or direct_spec:
             if not product_mode:
                 log(f"Processing direct spec URL: {base_url}", level="INFO")
-            swagger_spec = fetch_swagger_spec(base_url, verbose)
+            swagger_spec = direct_spec or fetch_swagger_spec(base_url, verbose)
             if swagger_spec:
                 with lock:
                     stats["hosts_with_valid_spec"] += 1
                 if not product_mode:
                     log("Successfully loaded spec.", level="INFO")
-                base_path = '/'
-                if 'servers' in swagger_spec and isinstance(swagger_spec['servers'], list) and swagger_spec['servers']:
-                    base_path = swagger_spec['servers'][0].get('url', '/')
-                elif 'basePath' in swagger_spec:
-                    base_path = swagger_spec.get('basePath', '/')
+                base_path = determine_base_path(swagger_spec, base_url, verbose)
                 if not product_mode:
                     log("Scanning endpoints.", level="INFO")
                 rslts = test_endpoints(
                     base_url, base_path, swagger_spec,
                     verbose, include_risk, include_all,
-                    product_mode=product_mode, rate=rate, brute=brute
+                    product_mode=product_mode, brute=brute
                 )
                 del swagger_spec
-                with results_lock:
-                    all_results.extend(rslts)
-                    if rslts:
-                        stats["hosts_with_valid_endpoint"] += 1
-                        for rr in rslts:
-                            if rr['pii_detected']:
-                                stats["hosts_with_pii"] += 1
-                                stats["pii_detection_methods"].update(rr['pii_detection_methods'])
-                                stats["regexes_found"].update(rr['regex_patterns_found'].values())
+                record_host_results(rslts)
                 return
             else:
                 if verbose:
@@ -1212,28 +1936,16 @@ def main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rat
                 stats["hosts_with_valid_spec"] += 1
             if not product_mode:
                 log(f"Spec identified via Swagger-UI detection.", level="INFO")
-            base_path = '/'
-            if 'servers' in swagger_spec and isinstance(swagger_spec['servers'], list) and swagger_spec['servers']:
-                base_path = swagger_spec['servers'][0].get('url', '/')
-            elif 'basePath' in swagger_spec:
-                base_path = swagger_spec.get('basePath', '/')
+            base_path = determine_base_path(swagger_spec, base_url, verbose)
             if not product_mode:
                 log("Scanning endpoints.", level="INFO")
             rslts = test_endpoints(
                 base_url, base_path, swagger_spec,
                 verbose, include_risk, include_all,
-                product_mode=product_mode, rate=rate, brute=brute
+                product_mode=product_mode, brute=brute
             )
             del swagger_spec
-            with results_lock:
-                all_results.extend(rslts)
-                if rslts:
-                    stats["hosts_with_valid_endpoint"] += 1
-                    for rr in rslts:
-                        if rr['pii_detected']:
-                            stats["hosts_with_pii"] += 1
-                            stats["pii_detection_methods"].update(rr['pii_detection_methods'])
-                            stats["regexes_found"].update(rr['regex_patterns_found'].values())
+            record_host_results(rslts)
             return
 
         # Phase 3: Direct spec path detection
@@ -1249,28 +1961,16 @@ def main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rat
                     stats["hosts_with_valid_spec"] += 1
                 if not product_mode:
                     log(f"Spec identified via direct path detection: {spec_url}", level="INFO")
-                base_path = '/'
-                if 'servers' in sws and isinstance(sws['servers'], list) and sws['servers']:
-                    base_path = sws['servers'][0].get('url', '/')
-                elif 'basePath' in sws:
-                    base_path = sws.get('basePath', '/')
+                base_path = determine_base_path(sws, base_url, verbose)
                 if not product_mode:
                     log("Scanning endpoints.", level="INFO")
                 rslts2 = test_endpoints(
                     base_url, base_path, sws,
                     verbose, include_risk, include_all,
-                    product_mode=product_mode, rate=rate, brute=brute
+                    product_mode=product_mode, brute=brute
                 )
                 del sws
-                with results_lock:
-                    all_results.extend(rslts2)
-                    if rslts2:
-                        stats["hosts_with_valid_endpoint"] += 1
-                        for rr in rslts2:
-                            if rr['pii_detected']:
-                                stats["hosts_with_pii"] += 1
-                                stats["pii_detection_methods"].update(rr['pii_detection_methods'])
-                                stats["regexes_found"].update(rr['regex_patterns_found'].values())
+                record_host_results(rslts2)
                 return
         else:
             if verbose:
@@ -1323,8 +2023,8 @@ def main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rat
     else:
         stats["percentage_hosts_with_endpoint"] = 0.0
 
-    stats["pii_detection_methods"] = list(stats["pii_detection_methods"])
-    stats["regexes_found"] = list(stats["regexes_found"])
+    stats["pii_detection_methods"] = sorted(stats["pii_detection_methods"])
+    stats["regexes_found"] = sorted(stats["regexes_found"])
 
     # Add total requests + average requests per second
     stats["total_requests_sent"] = TOTAL_REQUESTS
@@ -1336,17 +2036,13 @@ def main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rat
     if product_mode:
         grouped_results = {}
         for r in all_results:
-            if r['pii_detected'] or r['interesting_response']:
+            if r['pii_detected'] or r['secrets_detected'] or r['interesting_response']:
                 key = (r['method'], r['path_template'])
                 existing = grouped_results.get(key)
-                if existing:
-                    if r['content_length'] > existing['content_length']:
-                        grouped_results[key] = r
-                else:
+                if not existing or response_rank(r) > response_rank(existing):
                     grouped_results[key] = r
 
-        final_results = list(grouped_results.values())
-        final_results.sort(key=lambda x: (-x['content_length'], not x['pii_detected']))
+        final_results = sort_results(grouped_results.values())
 
         clean_final_results = []
         for r in final_results:
@@ -1361,20 +2057,17 @@ def main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rat
         output = {"results": clean_final_results}
         if stats_flag:
             output["stats"] = stats
-        console.print_json(data=output)
+        output_console.print_json(data=output)
+        report_results = clean_final_results
     else:
         grouped_results = {}
         for r in all_results:
             key = (r['method'], r['path_template'])
             existing = grouped_results.get(key)
-            if existing:
-                if r['content_length'] > existing['content_length']:
-                    grouped_results[key] = r
-            else:
+            if not existing or response_rank(r) > response_rank(existing):
                 grouped_results[key] = r
 
-        final_results = list(grouped_results.values())
-        final_results.sort(key=lambda x: (-x['content_length'], not x['pii_detected']))
+        final_results = sort_results(grouped_results.values())
 
         if include_all:
             final_results = [
@@ -1382,42 +2075,54 @@ def main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rat
                 if rr['status_code'] not in [401, 403]
             ]
         else:
+            # 2xx responses, plus any response that leaked a secret (e.g. in a 500 error page)
             final_results = [
                 rr for rr in final_results
-                if rr['status_code'] == 200
+                if 200 <= rr['status_code'] < 300 or rr['severity'] == 'critical'
             ]
 
-        if final_results:
-            if json_output:
-                out = {"results": final_results}
-                if stats_flag:
-                    out["stats"] = stats
-                console.print_json(data=out)
-            else:
-                table = Table(title="API Endpoints", show_lines=False)
+        report_results = final_results
+        if json_output:
+            out = {"results": final_results}
+            if stats_flag:
+                out["stats"] = stats
+            output_console.print_json(data=out)
+        elif final_results:
+            # One table per host, so multi-target scans stay readable
+            by_host = {}
+            for rr in final_results:
+                parsed = urlparse(rr['url'])
+                by_host.setdefault(f"{parsed.scheme}://{parsed.netloc}", []).append(rr)
+
+            for host, host_results in by_host.items():
+                table = Table(title=f"API Endpoints: {host}", show_lines=True)
+                table.add_column("Severity", no_wrap=True)
                 table.add_column("Method", style="cyan", no_wrap=True)
-                table.add_column("URL", style="magenta", overflow="fold")
-                table.add_column("Status Code", style="green")
-                table.add_column("Content Length", style="yellow")
-                table.add_column("PII or Secret Detected", style="red")
+                table.add_column("Path", style="magenta", overflow="fold")
+                table.add_column("Status", style="green", no_wrap=True)
+                table.add_column("Size", style="yellow", justify="right", no_wrap=True)
+                table.add_column("Findings", overflow="fold")
                 if include_risk:
                     table.add_column("Body", style="blue", overflow="fold")
 
-                for rr in final_results:
-                    pii_status = "Yes" if rr['pii_detected'] else "No"
+                for rr in host_results:
+                    parsed = urlparse(rr['url'])
+                    path = parsed.path + (f"?{parsed.query}" if parsed.query else "")
+                    sev_style = SEVERITY_STYLES[rr['severity']]
                     row = [
+                        f"[{sev_style}]{rr['severity'].upper()}[/{sev_style}]",
                         rr['method'],
-                        rr['url'],
+                        escape(path),
                         str(rr['status_code']),
                         f"{rr['content_length']:,}",
-                        pii_status
+                        escape("\n".join(rr['findings'])) if rr['findings'] else "[dim]-[/dim]"
                     ]
                     if include_risk:
                         body_content = rr['body'] if rr['body'] else ""
-                        row.append(body_content)
+                        row.append(escape(str(body_content)))
                     table.add_row(*row)
 
-                console.print(table)
+                output_console.print(table)
         else:
             log("No valid API responses found.", level="INFO")
 
@@ -1438,7 +2143,13 @@ def main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rat
                     v = f"{v:,}"
                 stats_table.add_row(k.replace('_',' ').title(), str(v))
 
-            console.print(stats_table)
+            output_console.print(stats_table)
+
+    # Save the full report (results + stats) as JSON if requested
+    if output_file:
+        with open(output_file, 'w') as f:
+            json.dump({"results": report_results, "stats": stats}, f, indent=2, default=str)
+        log(f"Results written to {output_file}", level="INFO")
 
     # Writes any bad hosts to a file for reference
     if bad_hosts:
@@ -1464,6 +2175,7 @@ if __name__ == "__main__":
     parser.add_argument("-rate", type=int, default=30, help="Set the rate limit in requests per second (default: 30). Use 0 to disable rate limiting.")
     parser.add_argument("-b", "--brute", action="store_true", help="Enable exhaustive testing of parameter values.")
     parser.add_argument("-json", action="store_true", help="Output results in JSON format in default mode.")
+    parser.add_argument("-o", "--output", metavar="FILE", help="Also write results and stats as JSON to FILE.")
 
     args = parser.parse_args()
 
@@ -1498,4 +2210,4 @@ if __name__ == "__main__":
         logger.addHandler(file_handler)
         logger.propagate = False
 
-    main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rate, brute, json_output)
+    main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rate, brute, json_output, args.output)
