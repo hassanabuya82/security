@@ -28,6 +28,10 @@
 
 Autoswagger automates the process of finding **OpenAPI/Swagger** specifications, extracting API endpoints, and systematically testing them for **PII** exposure, **secrets**, and large or interesting responses. It leverages **Presidio** for PII recognition and **regex** for sensitive key/token detection.
 
+By default it scans **unauthenticated**. When endpoints return 401/403, it reports how many require auth and suggests rerunning with credentials. Supplying credentials (`-H`, `--token`, `--auth-file`, or interactive `--login`) scans the API **as a logged-in user**, which is the foundation for the authorization testing on the roadmap (IDOR, privilege escalation).
+
+> **Authorized use only.** Run Autoswagger only against systems you have explicit written permission to test, especially in authenticated mode.
+
 ---
 
 ## Key Features
@@ -92,6 +96,14 @@ Autoswagger automates the process of finding **OpenAPI/Swagger** specifications,
 | `-b, --brute`        | Enables brute-forcing of parameter values (multiple test combos).                                            |
 | `-json`              | Outputs results in JSON format instead of a Rich table in default mode.                                      |
 | `-o, --output FILE`  | Also writes results and stats as JSON to FILE.                                                               |
+| `-H, --header`       | Header sent with every request (repeatable), e.g. `-H 'Authorization: Bearer ...'`. Enables authenticated scanning. |
+| `--cookie STRING`    | Cookie header sent with every request.                                                                      |
+| `--token TOKEN`      | Shortcut for `-H 'Authorization: Bearer TOKEN'`.                                                             |
+| `--auth-file FILE`   | JSON file: `{"headers": {...}, "cookie": "...", "token": "..."}`.                                            |
+| `--login`            | Prompt interactively for credentials before scanning.                                                       |
+| `--login-url URL`    | Log in by POSTing `--login-data` (JSON) here and reading a token from the response.                          |
+| `--login-data JSON`  | JSON credentials for `--login-url`.                                                                          |
+| `--token-path PATH`  | Dotted path to the token in the login response (default: `token`).                                           |
 
 
 ## Help

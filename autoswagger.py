@@ -2,6 +2,7 @@
 # Autoswagger - Cale Anderson @ Intruder    
 import argparse
 import hashlib
+import getpass
 import json
 import math
 import os
@@ -38,6 +39,7 @@ import logging
 # Global Variables for Stats
 # ------------------------------
 TOTAL_REQUESTS = 0       # Tracks total requests sent by the tool
+AUTH_REQUIRED_COUNT = 0  # Endpoints that answered 401/403 (i.e. require auth)
 SCAN_START_TIME = 0.0    # Records scan start time (for RPS calculation)
 SCAN_END_TIME = 0.0      # Records scan end time (for RPS calculation)
 
@@ -208,15 +210,55 @@ def retry_after_seconds(response, attempt):
         delay = 2 ** attempt
     return min(delay, MAX_RETRY_DELAY)
 
-def http_request(method, url, **kwargs):
+class Identity:
+    """
+    A named set of credentials attached to requests: HTTP headers (which may
+    include Authorization and Cookie). The anonymous identity has no headers.
+    """
+    def __init__(self, name="anonymous", headers=None):
+        self.name = name
+        self.headers = headers or {}
+
+    @property
+    def authenticated(self):
+        return bool(self.headers)
+
+    def __repr__(self):
+        return f"Identity({self.name!r}, {len(self.headers)} header(s))"
+
+# The identity used for the current scan. Replaced once, before scanning starts,
+# so every worker thread reads the same one.
+ANONYMOUS = Identity()
+active_identity = ANONYMOUS
+
+def set_active_identity(identity):
+    global active_identity
+    active_identity = identity
+
+def parse_header_arg(raw):
+    """
+    Parses a 'Name: value' CLI/file header into (name, value). Raises ValueError
+    if there is no colon.
+    """
+    if ':' not in raw:
+        raise ValueError(f"header must be in 'Name: value' form, got: {raw!r}")
+    name, _, value = raw.partition(':')
+    return name.strip(), value.strip()
+
+def http_request(method, url, identity=None, **kwargs):
     """
     Sends a request through the shared rate limiter and this thread's session.
+    The active identity's auth headers are attached (per-call headers win on a clash).
     429 and 503 are retried for any method (the server didn't process them);
     502 and 504 only for safe methods. Every attempt counts toward TOTAL_REQUESTS.
     """
     global TOTAL_REQUESTS
     kwargs.setdefault('timeout', TIMEOUT)
     safe_method = method.upper() in ('GET', 'HEAD', 'OPTIONS')
+
+    identity = identity if identity is not None else active_identity
+    if identity.headers:
+        kwargs['headers'] = {**identity.headers, **(kwargs.get('headers') or {})}
 
     for attempt in range(MAX_RETRIES + 1):
         rate_limiter.wait()
@@ -1136,8 +1178,12 @@ def send_request(method, base_url_no_path, full_path, parameters, value_mapping,
         )
         status_code = response.status_code
 
-        # Skip 401 and 403 by design
+        # Skip 401 and 403 by design, but count them: they mark endpoints that
+        # require authentication, which drives the "rerun with --login" hint
         if status_code in [401, 403]:
+            global AUTH_REQUIRED_COUNT
+            with request_count_lock:
+                AUTH_REQUIRED_COUNT += 1
             if verbose:
                 log(f"Skipping endpoint {method.upper()} {full_url} due to status code {status_code}", level="INFO")
             return None
@@ -1178,6 +1224,7 @@ def send_request(method, base_url_no_path, full_path, parameters, value_mapping,
             "method": method.upper(),
             "url": full_url,
             "path_template": full_path,
+            "identity": active_identity.name,
             "body": data if data else "",
             "status_code": status_code,
             "content_type": short_content_type(response),
@@ -1832,7 +1879,144 @@ def process_input(urls):
         processed.append(url)
     return processed
 
-def main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rate, brute, json_output, output_file=None):
+def dig(data, dotted_path):
+    """
+    Follows a dotted path into nested dicts/lists, e.g. 'data.token' or
+    'items.0.key'. Returns None if any step is missing.
+    """
+    node = data
+    for part in dotted_path.split('.'):
+        if isinstance(node, dict) and part in node:
+            node = node[part]
+        elif isinstance(node, list) and part.lstrip('-').isdigit() and -len(node) <= int(part) < len(node):
+            node = node[int(part)]
+        else:
+            return None
+    return node
+
+def headers_from_sources(header_args=None, cookie=None, token=None, auth_file=None):
+    """
+    Builds a header dict from CLI/file inputs: repeated 'Name: value' headers,
+    a Cookie string, a bearer token, and a JSON file of {"headers": {...},
+    "cookie": "...", "token": "..."}. Later sources merge over earlier ones.
+    """
+    headers = {}
+    if auth_file:
+        with open(auth_file) as f:
+            data = json.load(f)
+        headers.update(data.get('headers') or {})
+        if data.get('cookie'):
+            headers['Cookie'] = data['cookie']
+        if data.get('token'):
+            headers['Authorization'] = f"Bearer {data['token']}"
+    for raw in header_args or []:
+        name, value = parse_header_arg(raw)
+        headers[name] = value
+    if cookie:
+        headers['Cookie'] = cookie
+    if token:
+        headers['Authorization'] = f"Bearer {token}"
+    return headers
+
+def login_for_token(login_url, login_data, token_path="token",
+                    token_header="Authorization", token_prefix="Bearer ", verbose=False):
+    """
+    Exchanges credentials for a token: POSTs login_data as JSON to login_url,
+    reads the token at token_path from the JSON response, and returns it as a
+    header dict. Returns None on failure.
+    """
+    try:
+        resp = http_request('POST', login_url, identity=ANONYMOUS,
+                            json=login_data, allow_redirects=False)
+    except requests.exceptions.RequestException as e:
+        log(f"Login request to {login_url} failed: {e}", level="CRITICAL")
+        return None
+    if not 200 <= resp.status_code < 300:
+        log(f"Login failed: {login_url} returned {resp.status_code}", level="CRITICAL")
+        return None
+    try:
+        token = dig(resp.json(), token_path)
+    except ValueError:
+        token = None
+    if not token:
+        log(f"Login succeeded but no token at '{token_path}' in the response.", level="CRITICAL")
+        return None
+    if verbose:
+        log(f"Obtained token from {login_url} (path '{token_path}').", level="SUCCESS")
+    return {token_header: f"{token_prefix}{token}"}
+
+def prompt_for_identity(name="user"):
+    """
+    Interactively collects credentials for one identity. Offers a raw
+    token/header/cookie, or a username+password login against a login endpoint.
+    Returns an Identity, or the anonymous one if the user supplies nothing.
+    """
+    console.print(f"\n[bold]Enter credentials for identity '{name}'[/bold] "
+                  "(press Enter to skip a field).")
+    console.print("  [1] Bearer token   [2] Raw header   [3] Cookie   "
+                  "[4] Username/password login")
+    choice = input("Method [1-4, default 1]: ").strip() or "1"
+
+    try:
+        if choice == "2":
+            raw = input("Header (Name: value): ").strip()
+            headers = dict([parse_header_arg(raw)]) if raw else {}
+        elif choice == "3":
+            cookie = input("Cookie string: ").strip()
+            headers = {'Cookie': cookie} if cookie else {}
+        elif choice == "4":
+            login_url = input("Login URL: ").strip()
+            user_field = input("Username field name [username]: ").strip() or "username"
+            pass_field = input("Password field name [password]: ").strip() or "password"
+            username = input("Username: ").strip()
+            password = getpass.getpass("Password: ")
+            token_path = input("Token path in response [token]: ").strip() or "token"
+            headers = login_for_token(
+                login_url, {user_field: username, pass_field: password},
+                token_path=token_path, verbose=True
+            ) or {}
+        else:
+            token = getpass.getpass("Bearer token: ").strip()
+            headers = {'Authorization': f"Bearer {token}"} if token else {}
+    except (ValueError, KeyboardInterrupt) as e:
+        log(f"Credential entry cancelled: {e}", level="WARNING")
+        headers = {}
+
+    if not headers:
+        log(f"No credentials entered for '{name}'; continuing anonymously.", level="WARNING")
+        return ANONYMOUS
+    return Identity(name, headers)
+
+def build_identity(args):
+    """
+    Assembles the scan identity from CLI args: flags/file/login first, then an
+    interactive prompt if --login was given (or the inputs were incomplete).
+    Returns an Identity (anonymous if nothing was provided).
+    """
+    headers = headers_from_sources(args.header, args.cookie, args.token, args.auth_file)
+
+    if args.login_url and not headers:
+        if not args.login_data:
+            log("--login-url needs --login-data (JSON credentials).", level="CRITICAL")
+        else:
+            try:
+                creds = json.loads(args.login_data)
+            except ValueError:
+                log("--login-data must be valid JSON.", level="CRITICAL")
+                creds = None
+            if creds:
+                headers = login_for_token(args.login_url, creds,
+                                          token_path=args.token_path, verbose=args.verbose) or {}
+
+    if args.login and not headers:
+        if sys.stdin.isatty():
+            return prompt_for_identity("user")
+        log("--login needs an interactive terminal; use -H/--token/--auth-file instead.", level="CRITICAL")
+
+    return Identity("user", headers) if headers else ANONYMOUS
+
+def main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rate, brute, json_output,
+         output_file=None, identity=None):
     """
     Main function controlling flow:
     1. Tracks start time
@@ -1841,15 +2025,20 @@ def main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rat
     4. Accumulates results
     5. Prints or outputs final results and stats
     """
-    global SCAN_START_TIME, SCAN_END_TIME, TOTAL_REQUESTS
+    global SCAN_START_TIME, SCAN_END_TIME, TOTAL_REQUESTS, AUTH_REQUIRED_COUNT
     SCAN_START_TIME = time.time()  # Start the timer
     rate_limiter.set_rate(rate)
+    AUTH_REQUIRED_COUNT = 0
+    if identity is not None:
+        set_active_identity(identity)
+    scan_identity = active_identity
 
     all_results = []
     processed_urls = process_input(urls)
     results_lock = threading.Lock()
 
     stats = {
+        "scan_identity": active_identity.name,
         "unique_hosts_provided": len(set(urlparse(u).netloc for u in processed_urls)),
         "active_hosts": 0,
         "hosts_with_valid_spec": 0,
@@ -1983,6 +2172,8 @@ def main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rat
 
     if not product_mode:
         print_banner()
+    if scan_identity.authenticated:
+        log(f"Scanning as authenticated identity '{scan_identity.name}'.", level="INFO")
 
     max_workers2 = min(100, os.cpu_count() * 5, len(processed_urls)) if len(processed_urls) > 0 else 1
     with ThreadPoolExecutor(max_workers=max_workers2) as executor:
@@ -2145,6 +2336,13 @@ def main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rat
 
             output_console.print(stats_table)
 
+    stats["auth_required_endpoints"] = AUTH_REQUIRED_COUNT
+    # Nudge toward authenticated testing when anonymous and endpoints needed auth
+    if not scan_identity.authenticated and AUTH_REQUIRED_COUNT > 0 and not product_mode:
+        log(f"{AUTH_REQUIRED_COUNT} endpoint(s) returned 401/403 (authentication required). "
+            "Rerun with --login (or -H/--token) to test them as a logged-in user.",
+            level="INFO")
+
     # Save the full report (results + stats) as JSON if requested
     if output_file:
         with open(output_file, 'w') as f:
@@ -2176,6 +2374,22 @@ if __name__ == "__main__":
     parser.add_argument("-b", "--brute", action="store_true", help="Enable exhaustive testing of parameter values.")
     parser.add_argument("-json", action="store_true", help="Output results in JSON format in default mode.")
     parser.add_argument("-o", "--output", metavar="FILE", help="Also write results and stats as JSON to FILE.")
+
+    auth = parser.add_argument_group("authenticated testing")
+    auth.add_argument("-H", "--header", action="append", metavar="'Name: value'",
+                      help="Header sent with every request (repeatable), e.g. -H 'Authorization: Bearer ...'.")
+    auth.add_argument("--cookie", metavar="STRING", help="Cookie header sent with every request.")
+    auth.add_argument("--token", metavar="TOKEN", help="Shortcut for -H 'Authorization: Bearer TOKEN'.")
+    auth.add_argument("--auth-file", metavar="FILE",
+                      help="JSON file with {\"headers\": {...}, \"cookie\": \"...\", \"token\": \"...\"}.")
+    auth.add_argument("--login", action="store_true",
+                      help="Prompt interactively for credentials before scanning.")
+    auth.add_argument("--login-url", metavar="URL",
+                      help="Log in by POSTing --login-data (JSON) here and reading a token from the response.")
+    auth.add_argument("--login-data", metavar="JSON",
+                      help="JSON credentials for --login-url, e.g. '{\"username\":\"a\",\"password\":\"b\"}'.")
+    auth.add_argument("--token-path", metavar="PATH", default="token",
+                      help="Dotted path to the token in the login response (default: token).")
 
     args = parser.parse_args()
 
@@ -2210,4 +2424,7 @@ if __name__ == "__main__":
         logger.addHandler(file_handler)
         logger.propagate = False
 
-    main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rate, brute, json_output, args.output)
+    scan_identity = build_identity(args)
+
+    main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rate, brute, json_output,
+         args.output, identity=scan_identity)
