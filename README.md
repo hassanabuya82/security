@@ -2,283 +2,294 @@
 <a href="https://intruder.io/">
   <img width="966" alt="output" src="https://github.com/user-attachments/assets/e502abaf-426c-4fab-ad60-d7b5dcd730d8" />
 </a>
-<br>  
-<br>  
+<br>
+<br>
 
-**[Autoswagger](https://www.intruder.io/research/broken-authorization-apis-autoswagger)** is a command-line tool designed to discover, parse, and test for unauthenticated endpoints using **Swagger/OpenAPI** documentation. It helps identify potential security issues in unprotected endpoints of APIs, such as PII leaks and common secret exposures.
+**Autoswagger** discovers and parses **Swagger/OpenAPI** documentation and tests the endpoints it describes for access-control and data-exposure problems.
 
-**Please note that this initial release of Autoswagger is by no means complete, and there are some types of specification which the tool does not currently handle. Please feel free to use it as you wish, and extend its detection capabilities or add detection regexes to cover your specific use-case!**
+It started as an *unauthenticated* scanner — find endpoints that answer without credentials, and flag PII, secrets and large responses. This fork extends it into an **authenticated API security scanner**: give it credentials and it will also look for broken object-level authorization (IDOR), privilege escalation, injection indicators, missing rate limiting, and weak JWT handling.
+
+> ⚠️ **Authorized use only.** Autoswagger sends requests to the target, and in authenticated/active modes it sends crafted requests. Run it **only** against systems you have explicit, written permission to test.
 
 ---
 
 ## Table of Contents
-1. [Introduction](#introduction)
-2. [Key Features](#key-features)
-3. [Installation & Usage](#installation--usage)
-4. [Discovery Phases](#discovery-phases)
-5. [Endpoint Testing](#endpoint-testing)
-6. [PII Detection](#pii-detection)
-7. [Output Examples](#output)
-8. [Stats & Reporting](#stats--reporting)
-9. [Acknowledgments](#acknowledgments)
-
----
-
-## Introduction
-
-Autoswagger automates the process of finding **OpenAPI/Swagger** specifications, extracting API endpoints, and systematically testing them for **PII** exposure, **secrets**, and large or interesting responses. It leverages **Presidio** for PII recognition and **regex** for sensitive key/token detection.
-
-By default it scans **unauthenticated**. When endpoints return 401/403, it reports how many require auth and suggests rerunning with credentials. Supplying credentials (`-H`, `--token`, `--auth-file`, or interactive `--login`) scans the API **as a logged-in user**, which is the foundation for the authorization testing on the roadmap (IDOR, privilege escalation).
-
-> **Authorized use only.** Run Autoswagger only against systems you have explicit written permission to test, especially in authenticated mode.
+1. [Key Features](#key-features)
+2. [Installation](#installation)
+3. [How to Use — Step by Step](#how-to-use--step-by-step)
+   - [Step 1 — Unauthenticated scan](#step-1--unauthenticated-scan)
+   - [Step 2 — Authenticated scan](#step-2--authenticated-scan)
+   - [Step 3 — IDOR / BOLA (two users)](#step-3--idor--bola-two-users)
+   - [Step 4 — Privilege escalation (admin vs user)](#step-4--privilege-escalation-admin-vs-user)
+   - [Step 5 — Injection & rate-limit checks](#step-5--injection--rate-limit-checks)
+   - [Step 6 — JWT / token checks](#step-6--jwt--token-checks)
+   - [Saving and piping output](#saving-and-piping-output)
+4. [All Flags](#all-flags)
+5. [How Detection Works](#how-detection-works)
+6. [Reading the Output](#reading-the-output)
+7. [Stats & Reporting](#stats--reporting)
+8. [Acknowledgments](#acknowledgments)
 
 ---
 
 ## Key Features
 
-- **Multiple Discovery Phases**  
-  Discovers OpenAPI specs in three ways:
-  1. **Direct Spec**: If a full URL with a path ending in `.json`, `.yaml`, or `.yml` is provided, parse that file directly.  
-  2. **Swagger UI**: Parse known paths of Swagger UI (e.g. `/swagger-ui.html`), and extract spec from HTML or JavaScript.  
-  3. **Direct Spec by Bruteforce**: Attempt discovery using common OpenAPI schema locations (`/swagger.json`, `/openapi.json`, etc.). Only attempt this if 1. and 2. did not yield a result.
-
-- **Parallel Endpoint Testing**  
-  Multi-threaded concurrent testing of many endpoints, respecting a configurable rate limit (`-rate`).
-
-- **Brute-Force of Parameter Values**  
-  If `-b` or `--brute` is used, try using various data types with a few example values in an attempt to bypass parameter-specific validations.
-
-- **Presidio PII Detection**  
-  Check output for phone numbers, emails, addresses, and names (with context validation to reduce false positives). Also parse CSV rows and naive “key: value” lines.
-
-- **Secrets Detection**  
-  Leverages a set of regex patterns to detect tokens, keys, and debugging artifacts (like environment variables).
-
-- **Command Line or JSON Output**  
-  In default mode, displays results in a table. With `-json`, output a JSON structure. `-product` mode filters output to only show those that contain PII, secrets, or large responses.
-
+- **Spec discovery** — from a direct spec URL, a Swagger UI page, or a brute-force list of common locations (including extensionless ones such as `/v3/api-docs`).
+- **Accurate parsing** — resolves `$ref`, honours path-level and Swagger 2 parameters, uses the spec's own `example`/`default` values, and handles absolute/templated `servers` URLs.
+- **Data-exposure detection** — PII via Presidio (names, emails, phones, addresses) including inside minified JSON, secrets via regex + entropy checks, and large data dumps.
+- **Fewer false positives** — fingerprints a random nonexistent path and discards catch-all / soft-404 / SPA-fallback pages.
+- **Authenticated scanning** — attach a token, cookie or headers, or log in interactively.
+- **Authorization testing** — IDOR/BOLA (cross-user access) and privilege escalation (admin-only endpoints reachable by lower-privilege users).
+- **Active testing (opt-in, GET-only)** — SQL-error and reflected-input (XSS) indicators, a bounded rate-limit probe, and JWT hygiene + signature-verification checks.
+- **Readable output** — one severity-ranked table per host, with findings and redacted samples; clean JSON to stdout (`-json`) and an optional JSON report file (`-o`).
 
 ---
 
-## Installation & Usage
+## Installation
 
-1. **Clone** or **download** the repository containing Autoswagger.
-   ```bash
-   git clone git@github.com:intruder-io/autoswagger.git
-   ```
+Requires **Python 3.8+**.
 
+```bash
+# 1. Clone
+git clone https://github.com/hassanabuya82/security.git
+cd security
 
-2. **Install dependencies** (e.g., using Python 3.7+):
-   ```bash
-   pip install -r requirements.txt
-   ```
+# 2. Create a virtual environment (recommended)
+python3 -m venv venv
+source venv/bin/activate
 
-   (It's recommended to use a virtual environment for this: `python3 -m venv venv;source venv/bin/activate`)
+# 3. Install dependencies
+pip install -r requirements.txt
 
-3. **Check installation, show help:**
-  ```bash
-  python3 autoswagger.py -h
-  ```
+# 4. Download the Presidio language model (needed for PII detection)
+python3 -m spacy download en_core_web_lg
 
-
-
-## Flags 
-
-| Flag                 | Description                                                                                                 |
-|----------------------|-------------------------------------------------------------------------------------------------------------|
-| `urls`               | List of base URLs or direct spec URLs.                                                                       |
-| `-v, --verbose`      | Enables verbose logging. Creates a log file under `~/.autoswagger/logs`.                                     |
-| `-risk`              | Includes non-GET methods (POST, PUT, PATCH, DELETE) in testing.                                              |
-| `-all`               | Includes 200 and 404 endpoints in output (excludes 401/403).                                                 |
-| `-product`           | Outputs only endpoints with PII or large responses, in JSON format.                                          |
-| `-stats`             | Displays scan statistics (e.g. requests, RPS, hosts with PII).                                               |
-| `-rate <N>`          | Throttles requests to N requests per second. Default is 30. Use 0 to disable rate limiting.                  |
-| `-b, --brute`        | Enables brute-forcing of parameter values (multiple test combos).                                            |
-| `-json`              | Outputs results in JSON format instead of a Rich table in default mode.                                      |
-| `-o, --output FILE`  | Also writes results and stats as JSON to FILE.                                                               |
-| `-H, --header`       | Header sent with every request (repeatable), e.g. `-H 'Authorization: Bearer ...'`. Enables authenticated scanning. |
-| `--cookie STRING`    | Cookie header sent with every request.                                                                      |
-| `--token TOKEN`      | Shortcut for `-H 'Authorization: Bearer TOKEN'`.                                                             |
-| `--auth-file FILE`   | JSON file: `{"headers": {...}, "cookie": "...", "token": "..."}`.                                            |
-| `--login`            | Prompt interactively for credentials before scanning.                                                       |
-| `--login-url URL`    | Log in by POSTing `--login-data` (JSON) here and reading a token from the response.                          |
-| `--login-data JSON`  | JSON credentials for `--login-url`.                                                                          |
-| `--token-path PATH`  | Dotted path to the token in the login response (default: `token`).                                           |
-| `--idor`             | After scanning as the primary identity, replay object reads as a second identity and anonymously; flag cross-user access (BOLA/IDOR). |
-| `--header2 / --cookie2 / --token2 / --auth-file2` | Credentials for the second identity used by `--idor`.                            |
-| `--privesc`          | Scan as the primary (admin) identity, then check whether the second identity or anonymous requests can reach privileged (admin) endpoints. |
-| `--injection`        | Probe GET parameters for SQL-error and reflected-input (XSS) indicators using benign markers. |
-| `--rate-limit-check` | Send a small bounded burst to one endpoint and report whether it throttles (429/503). |
-| `--rate-limit-burst N` | Requests in the rate-limit burst (default 25, max 200). |
-| `--jwt`              | Analyze supplied bearer token(s) for weak JWT settings and test whether the server verifies the signature. |
-
-
-## Help
-
+# 5. Check it runs
+python3 autoswagger.py -h
 ```
 
+---
 
-      /   | __  __/ /_____  ______      ______ _____ _____ ____  _____
-     / /| |/ / / / __/ __ \/ ___/ | /| / / __ `/ __ `/ __ `/ _ \/ ___/
-    / ___ / /_/ / /_/ /_/ (__  )| |/ |/ / /_/ / /_/ / /_/ /  __/ /
-    /_/  |_\__,_/\__/\____/____/ |__/|__/_\__,_/\__, /\__, /\___/_/
-                                              /____//____/
-                              https://intruder.io
-                          Find unauthenticated endpoints
+## How to Use — Step by Step
 
-usage: autoswagger.py [-h] [-v] [-risk] [-all] [-product] [-stats] [-rate RATE] [-b] [-json] [-o FILE] [urls ...]
+The tool is designed to be used in escalating stages. Start unauthenticated; only move to the next stage when you have what it needs (credentials for one user, then two, then an admin).
 
-Autoswagger: Detect unauthenticated access control issues via Swagger/OpenAPI documentation.
+### Step 1 — Unauthenticated scan
 
-positional arguments:
-  urls           Base URL(s) or spec URL(s) of the target API(s)
+Point it at a base URL or a spec URL. No credentials needed.
 
-options:
-  -h, --help     show this help message and exit
-  -v, --verbose  Enable verbose output
-  -risk          Include non-GET requests in testing
-  -all           Include all HTTP status codes in the results, excluding 401 and 403
-  -product       Output all endpoints in JSON, flagging those that contain PII or have large responses.
-  -stats         Display scan statistics. Included in JSON if -product or -json is used.
-  -rate RATE     Set the rate limit in requests per second (default: 30). Use 0 to disable rate limiting.
-  -b, --brute    Enable exhaustive testing of parameter values.
-  -json          Output results in JSON format in default mode.
-  -o, --output FILE  Also write results and stats as JSON to FILE.
+```bash
+# Give it the API's base URL (it will discover the spec)...
+python3 autoswagger.py https://api.example.com
 
-Example usage:
-  python autoswagger.py https://api.example.com -v
+# ...or a direct spec URL
+python3 autoswagger.py https://api.example.com/openapi.json
 
+# Add -stats for a summary, -v to see every request (and write a log file)
+python3 autoswagger.py https://api.example.com -stats -v
 ```
-## Discovery Phases
 
-1. **Direct Spec**  
-   If a provided URL ends with `.json/.yaml/.yml`, Autoswagger **directly** attempts to parse the OpenAPI schema.
+What you get: a table of endpoints that answered, with a severity and the findings (PII, secrets, large responses). If some endpoints returned **401/403**, Autoswagger counts them and prints:
 
-2. **Swagger-UI Detection**  
-   - Tries known UI paths (e.g., `/swagger-ui.html`).
-   - If found, parses the HTML or local JavaScript files for a `swagger.json` or `openapi.json`.
-   - Can detect embedded configs like `window.swashbuckleConfig`.
+> *N endpoint(s) returned 401/403 (authentication required). Rerun with --login (or -H/--token) to test them as a logged-in user.*
 
-3. **Direct Spec by Bruteforce**  
-   - If no spec is found so far, Autoswagger attempts a list of default endpoints like `/swagger.json`, `/openapi.json`, etc.
-   - Stops when a valid spec is discovered or none are found.
+That is your cue for Step 2.
+
+> **Tip:** `-risk` also tests POST/PUT/PATCH/DELETE. `-all` shows 404s too. `-rate N` caps requests per second (default 30; `-rate 0` disables the limit).
+
+### Step 2 — Authenticated scan
+
+Supply credentials and Autoswagger attaches them to **every** request, so it sees what a logged-in user sees. Pick whichever method fits how your API authenticates:
+
+```bash
+# A bearer token
+python3 autoswagger.py https://api.example.com --token "eyJhbGci..."
+
+# An arbitrary header (repeatable) — e.g. an API key
+python3 autoswagger.py https://api.example.com -H "X-API-Key: abc123"
+
+# A cookie / session
+python3 autoswagger.py https://api.example.com --cookie "session=abcd1234"
+
+# A credentials file:  {"headers": {...}, "cookie": "...", "token": "..."}
+python3 autoswagger.py https://api.example.com --auth-file creds.json
+
+# Log in by exchanging username/password for a token
+python3 autoswagger.py https://api.example.com \
+  --login-url https://api.example.com/login \
+  --login-data '{"username":"jane","password":"s3cret"}' \
+  --token-path data.accessToken
+
+# Or be prompted interactively (nothing typed is echoed to screen or logs)
+python3 autoswagger.py https://api.example.com --login
+```
+
+`--token-path` is a dotted path into the login JSON response (e.g. `data.accessToken`, default `token`). Each result is labelled with the identity that produced it.
+
+### Step 3 — IDOR / BOLA (two users)
+
+**Broken object-level authorization** means one user can read another user's objects. Proving it needs **two** accounts. Autoswagger scans as user A, notes the object endpoints it could read (e.g. `/users/{id}`), then re-requests those exact URLs as user B and anonymously.
+
+```bash
+python3 autoswagger.py https://api.example.com \
+  --token "$TOKEN_A" \
+  --idor --token2 "$TOKEN_B"
+```
+
+- The **primary** identity (A) uses the Step 2 flags (`--token`, `-H`, `--auth-file`, `--login`).
+- The **second** identity (B) uses the `2`-suffixed flags: `--token2`, `--header2`, `--cookie2`, `--auth-file2`. (With `--login`, you are prompted for both.)
+- Result: **HIGH** if B gets back A's object; **CRITICAL** if an anonymous request does.
+- Only `GET` is replayed (re-reading is non-destructive).
+
+### Step 4 — Privilege escalation (admin vs user)
+
+Scan as an **admin**, then check whether a lower-privilege user (or anonymous) can reach privileged endpoints. "Privileged" means an admin-like path (`/admin/...`, `/manage/...`, `/internal/...`) or a privileged security scope such as `admin:read`.
+
+```bash
+python3 autoswagger.py https://api.example.com \
+  --token "$ADMIN_TOKEN" \
+  --privesc --token2 "$USER_TOKEN"
+```
+
+- **HIGH/CRITICAL** when the same privileged data comes back to the user/anonymous.
+- **MEDIUM** when the endpoint merely failed to reject them (2xx with a different body).
+- With no second identity, it tests anonymous access only.
+
+### Step 5 — Injection & rate-limit checks
+
+Opt-in, **GET-only**, non-destructive. These send crafted requests — authorization required.
+
+```bash
+# Injection indicators on every GET parameter
+python3 autoswagger.py https://api.example.com --token "$TOKEN" --injection
+
+# Is the API rate-limited? (small bounded burst, not a load test)
+python3 autoswagger.py https://api.example.com --rate-limit-check --rate-limit-burst 25
+```
+
+- **`--injection`** sends two benign markers per parameter: a single quote (looks for a *new* database error → possible SQL injection, **HIGH**) and a unique string with HTML specials (looks for it reflected unencoded in an HTML/JS response → possible XSS, **MEDIUM**). It sends **no exploit payloads**; findings are indicators to confirm by hand.
+- **`--rate-limit-check`** sends a small burst (`--rate-limit-burst`, default 25, max 200) to one endpoint and reports whether the server throttled (429/503). `info` = throttling seen; `low` = none seen (rate limiting may be absent).
+
+### Step 6 — JWT / token checks
+
+If you authenticate with a JWT bearer token, `--jwt` adds token-specific checks.
+
+```bash
+python3 autoswagger.py https://api.example.com --token "$JWT" --jwt
+```
+
+- **Offline hygiene** (no requests): flags `alg: none` (**CRITICAL**), symmetric algorithms (**LOW**), a missing or very long `exp` (**MEDIUM/LOW**), and PII/secrets carried in the payload (**MEDIUM/HIGH**).
+- **Signature verification** (one GET endpoint): re-requests it with tampered tokens — an `alg:none` variant, a stripped signature, and a corrupted signature. If any is accepted with the same response, the server is **not verifying the signature** (**CRITICAL**).
+
+### Saving and piping output
+
+```bash
+# Human-readable tables (default)
+python3 autoswagger.py https://api.example.com --token "$T"
+
+# Clean JSON on stdout (logs go to stderr), ready for jq
+python3 autoswagger.py https://api.example.com --token "$T" -json | jq '.results'
+
+# Save the full report (results + all findings + stats) to a file
+python3 autoswagger.py https://api.example.com --token "$T" -o report.json
+
+# Only the interesting endpoints, as JSON
+python3 autoswagger.py https://api.example.com --token "$T" -product
+```
+
+You can combine any of the stages in one run, e.g.:
+
+```bash
+python3 autoswagger.py https://api.example.com \
+  --token "$ADMIN_TOKEN" --token2 "$USER_TOKEN" \
+  --idor --privesc --injection --jwt --rate-limit-check \
+  -stats -o report.json
+```
 
 ---
 
-## Endpoint Testing
+## All Flags
 
-1. **Collect Endpoints**  
-   After loading a spec, Autoswagger extracts each path and method under the `paths` key.
-
-2. **HTTP Methods**  
-   - By default, tests `GET` only.  
-   - Use `-risk` to include other methods (`POST`, `PUT`, `PATCH`, `DELETE`).
-
-3. **Parameter Values**  
-   - Fill path/query parameters with defaults or values to enumerate.  
-   - Optionally builds request bodies from the spec’s `requestBody` (OpenAPI 3) or body parameters (Swagger 2).
-
-4. **Rate Limiting & Concurrency**  
-   - `-rate` caps the total requests per second across all threads.  
-   - 429/503 responses are retried after `Retry-After` (backing off every thread); 502/504 are retried for GET only.  
-   - Each endpoint is tested in a dedicated job.
-
-5. **Response Analysis**  
-   - Decodes responses, checks for PII, secrets, and large content.  
-   - Logs relevant findings.
-
----
-
-## PII Detection
-
-1. **Presidio-Based Analysis**  
-   - Searches for phone numbers, emails, addresses, names.  
-   - Context-based scanning (e.g., CSV headers, key-value lines).
-
-2. **Secrets & Debug Info**  
-   - TruffleHog-like regex checks for API keys, tokens, environment variables.  
-   - Secrets are reported separately from PII (`secrets_data`); stack traces and debug pages are reported as low-severity `debug_info`.
-
-3. **Large Response Check**  
-   - Flags responses with 100+ JSON elements or large XML structures as “interesting.”  
-   - Also checks raw size threshold (e.g., >100k bytes).
+| Flag | Description |
+|------|-------------|
+| `urls` | One or more base URLs or direct spec URLs (also read from stdin). |
+| `-v, --verbose` | Verbose logging; also writes a log file under `~/.autoswagger/logs`. |
+| `-risk` | Include non-GET methods (POST, PUT, PATCH, DELETE) in testing. |
+| `-all` | Include all status codes in output except 401/403. |
+| `-product` | Output only interesting endpoints (PII, secrets, large responses, auth-not-enforced), as JSON. |
+| `-stats` | Show scan statistics. |
+| `-rate N` | Total requests per second across all threads (default 30; `0` disables). |
+| `-b, --brute` | Try multiple parameter-value combinations to get past validation. |
+| `-json` | JSON output on stdout. |
+| `-o, --output FILE` | Also write results, findings and stats as JSON to FILE. |
+| **Authenticated testing** | |
+| `-H, --header 'Name: value'` | Header sent with every request (repeatable). Enables authenticated scanning. |
+| `--cookie STRING` | Cookie header sent with every request. |
+| `--token TOKEN` | Shortcut for `-H 'Authorization: Bearer TOKEN'`. |
+| `--auth-file FILE` | JSON file: `{"headers": {...}, "cookie": "...", "token": "..."}`. |
+| `--login` | Prompt interactively for credentials (and a second identity with `--idor`). |
+| `--login-url URL` | Log in by POSTing `--login-data` here and reading a token from the response. |
+| `--login-data JSON` | JSON credentials for `--login-url`. |
+| `--token-path PATH` | Dotted path to the token in the login response (default `token`). |
+| **Authorization testing** | |
+| `--idor` | Replay the primary identity's object reads as a second identity and anonymously; flag cross-user access. |
+| `--header2 / --cookie2 / --token2 / --auth-file2` | Credentials for the second identity. |
+| `--privesc` | Check whether the second identity or anonymous requests can reach privileged (admin) endpoints. |
+| **Active testing (authorization required)** | |
+| `--injection` | Probe GET parameters for SQL-error and reflected-input (XSS) indicators using benign markers. |
+| `--rate-limit-check` | Send a small bounded burst to one endpoint and report whether it throttles. |
+| `--rate-limit-burst N` | Requests in the burst (default 25, max 200). |
+| `--jwt` | Analyze supplied bearer token(s) and test whether the server verifies the signature. |
 
 ---
 
-## Output
+## How Detection Works
 
-By default, output is shown as one table per host, sorted by severity:
+**Spec discovery**
+1. **Direct spec** — a URL ending in `.json/.yaml/.yml`, or any path that returns a valid spec (e.g. `/v3/api-docs`), is parsed directly.
+2. **Swagger UI** — known UI paths are scanned; the spec URL is extracted from the HTML/JS (including `configUrl` and `swashbuckleConfig`).
+3. **Brute force** — a list of common spec locations is tried only if 1 and 2 fail.
+
+A document is accepted only if it actually looks like a spec (`swagger`/`openapi` plus a `paths` object), whatever its Content-Type.
+
+**Endpoint testing**
+- GET by default; `-risk` adds other methods.
+- Parameters are filled from the spec's `example`/`default` first, then type-appropriate test values; `-b` tries more combinations.
+- One shared rate limiter caps total throughput; 429/503 are retried honouring `Retry-After`.
+- Before scanning, a random nonexistent path is requested to fingerprint unknown-route responses; matching catch-all/soft-404/SPA pages are discarded.
+
+**Data exposure**
+- **PII** via Presidio (names, emails, phones, addresses), parsing JSON structurally so minified bodies are covered; field-name context reduces false positives.
+- **Secrets** via regex with bounded patterns and an entropy check; reported separately from PII (`secrets_data`).
+- **Debug info** (stack traces, debug pages) reported as low-severity `debug_info`.
+- **Large responses**: 100+ records (including `{"data":[...]}` wrappers) or >100 KB.
+
+---
+
+## Reading the Output
+
+By default, results are shown as one table per host, sorted by severity:
 
 | Severity | Meaning |
 |----------|---------|
-| CRITICAL | A secret (API key, token, private key) is in the response, at any status code |
-| HIGH     | PII in a 2xx response |
-| MEDIUM   | A 2xx from an endpoint the spec says requires auth, or a large data dump (100+ records or >100 KB) |
-| LOW      | Stack trace or debug page |
-| INFO     | Responded, nothing notable found |
+| CRITICAL | A secret in the response, or anonymous access to a protected object, or an unverified JWT signature |
+| HIGH     | PII in a 2xx response, cross-user object access, or a SQL-injection indicator |
+| MEDIUM   | Auth the spec requires but did not enforce, a large data dump, a reflected-input (XSS) indicator, or a privileged endpoint that failed to reject a user |
+| LOW      | Stack trace / debug page, or weak-but-not-broken JWT settings |
+| INFO     | Responded; nothing notable found |
 
-The **Findings** column lists what was found, with counts and a masked sample (e.g. `PII: Email ×12 (j***@acme.io)`).
+The **Findings** column lists what was found, with counts and a masked sample (e.g. `PII: Email ×12 (j***@acme.io)`). Authorization, injection, rate-limit and JWT findings are shown in their own tables below the endpoint table, and included under `idor_findings`, `privesc_findings`, `injection_findings`, `rate_limit_findings` and `jwt_findings` in JSON/`-o` output.
 
-Before testing, Autoswagger requests a random nonexistent path to learn what the server returns for unknown routes, and discards responses that match it (catch-all pages and SPA fallbacks that return 200 for every path).
-
-- `-json` produces JSON objects, grouping results by endpoint. Logs go to stderr, so `-json` output can be piped straight into tools like `jq`.
-- `-product` filters down to only “interesting” endpoints (PII, secrets, large responses and auth not enforced).
-- `-o FILE` additionally saves results and stats as JSON.
-
----
-
-## Interpreting Results
-
-Start with CRITICAL and HIGH rows: these are responses that contained secrets or PII without authentication. "Auth not enforced" findings are endpoints the spec itself says need credentials, but which answered an unauthenticated request with a 2xx. These are strong candidates for broken access control. All findings should be manually checked to confirm. You may also wish to look at INFO rows and determine whether it's intended for these endpoints to be public or not.
-
-Simple GET endpoints can be triaged using command line tools like curl, but we would recommend using your usual API testing suite (tools such as Postman or Burp Suite) to replay requests and read responses to confirm whether an exposure is present.
-
----
-
-## Authorization testing (IDOR / BOLA)
-
-With `--idor` and two identities, Autoswagger looks for **broken object-level authorization** — one user reading another user's objects:
-
-1. It scans as the **primary** identity (`-H`/`--token`/`--login`) and records the object endpoints (e.g. `/users/{id}`) it could read.
-2. It re-requests each of those exact URLs as the **second** identity (`--token2`/`--auth-file2`/`--header2`) and anonymously.
-3. If the second identity or an anonymous request gets back the **same object**, that is reported as a finding: `HIGH` for cross-user access, `CRITICAL` for anonymous access.
-
-```bash
-python3 autoswagger.py https://api.example.com --token "$TOKEN_A" --idor --token2 "$TOKEN_B"
-```
-
-Only `GET` is replayed (re-reading is non-destructive). This needs real credentials for two accounts; run it only against systems you are authorized to test.
-
-### Privilege escalation (`--privesc`)
-
-Run as the **admin** identity with a lower-privilege second identity. Autoswagger finds endpoints that look privileged — an admin-like path segment (`/admin/...`, `/manage/...`, `/internal/...`) or a security scope such as `admin:read` — that the admin could read, then re-requests each as the lower-privilege identity and anonymously. A `2xx` means the privilege was not enforced: `HIGH`/`CRITICAL` when the same privileged data comes back, `MEDIUM` when the endpoint simply failed to reject the request.
-
-```bash
-python3 autoswagger.py https://api.example.com --token "$ADMIN_TOKEN" --privesc --token2 "$USER_TOKEN"
-```
-
-### Active testing (`--injection`, `--rate-limit-check`)
-
-These send crafted requests, so use them only against systems you are authorized to test.
-
-- **`--injection`** probes each GET parameter with two benign markers: a single quote (and looks for a *new* database error in the response — a SQL-injection indicator) and a unique string with HTML special characters (and looks for it reflected unencoded in an HTML/JS response — an XSS indicator). It reads only and sends no exploit payloads; findings are indicators to confirm manually.
-- **`--rate-limit-check`** sends a small bounded burst (`--rate-limit-burst`, default 25) to one endpoint and reports whether the server throttled. It is a configuration check, not a load test.
-- **`--jwt`** inspects any bearer token you supply (offline, no requests): it flags `alg: none`, symmetric algorithms, a missing or very long expiry, and PII/secrets carried in the payload. It then re-requests one protected endpoint with tampered tokens (an `alg:none` variant, a stripped signature, a corrupted signature); if the server accepts any of them, the signature is not being verified (`CRITICAL`).
+**Interpreting:** start with CRITICAL and HIGH. Every finding is an *indicator* — confirm it by hand (curl, Postman, or Burp Suite) before reporting. INFO rows are worth a glance to decide whether those endpoints are meant to be public.
 
 ---
 
 ## Stats & Reporting
 
-- `-stats` appends or prints overall statistics, such as:
-  - Hosts with valid specs
-  - Hosts with PII, hosts with secrets
-  - Total requests sent, average RPS
-  - Percentage of endpoints responding with 2xx or 4xx
-  - Shown in either a Rich table in default mode or embedded in JSON if `-json` or `-product` is used.
+`-stats` prints a summary: hosts with a valid spec, hosts with PII, hosts with secrets, endpoints requiring auth, counts of each authorization/active finding, total requests sent and average requests/second. It is embedded in the JSON when `-json`, `-product` or `-o` is used.
 
 ---
 
 ## Acknowledgments
 
-Autoswagger is maintained and owned by **[Intruder](https://intruder.io/)**. It was primarily developed by Cale Anderson
-
+Autoswagger was created and is owned by **[Intruder](https://intruder.io/)**, primarily developed by Cale Anderson. This is an extended fork that adds authenticated and authorization testing. The original project and its MIT license are retained.
