@@ -106,6 +106,7 @@ By default it scans **unauthenticated**. When endpoints return 401/403, it repor
 | `--token-path PATH`  | Dotted path to the token in the login response (default: `token`).                                           |
 | `--idor`             | After scanning as the primary identity, replay object reads as a second identity and anonymously; flag cross-user access (BOLA/IDOR). |
 | `--header2 / --cookie2 / --token2 / --auth-file2` | Credentials for the second identity used by `--idor`.                            |
+| `--privesc`          | Scan as the primary (admin) identity, then check whether the second identity or anonymous requests can reach privileged (admin) endpoints. |
 
 
 ## Help
@@ -243,6 +244,14 @@ python3 autoswagger.py https://api.example.com --token "$TOKEN_A" --idor --token
 ```
 
 Only `GET` is replayed (re-reading is non-destructive). This needs real credentials for two accounts; run it only against systems you are authorized to test.
+
+### Privilege escalation (`--privesc`)
+
+Run as the **admin** identity with a lower-privilege second identity. Autoswagger finds endpoints that look privileged — an admin-like path segment (`/admin/...`, `/manage/...`, `/internal/...`) or a security scope such as `admin:read` — that the admin could read, then re-requests each as the lower-privilege identity and anonymously. A `2xx` means the privilege was not enforced: `HIGH`/`CRITICAL` when the same privileged data comes back, `MEDIUM` when the endpoint simply failed to reject the request.
+
+```bash
+python3 autoswagger.py https://api.example.com --token "$ADMIN_TOKEN" --privesc --token2 "$USER_TOKEN"
+```
 
 ---
 

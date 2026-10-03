@@ -1039,6 +1039,36 @@ def required_auth_schemes(spec, details):
             schemes.extend(name for name in req if name not in schemes)
     return schemes
 
+# Path segments and scope/role words that mark an endpoint as privileged
+ADMIN_PATH_HINTS = {
+    "admin", "admins", "administrator", "administration", "superuser", "superadmin",
+    "root", "manage", "management", "manager", "internal", "console", "backoffice",
+    "sysadmin", "privileged", "moderator", "staff", "operator",
+}
+ADMIN_SCOPE_HINTS = ("admin", "superuser", "manage", "write:admin", "root", "sudo", "elevated")
+
+def privileged_reason(path_template, spec, details):
+    """
+    Returns a short reason if an endpoint looks privileged (admin-only), else None.
+    Two signals: an admin-like path segment, or a security scope/role that implies
+    elevated access.
+    """
+    segments = {seg.lower() for seg in re.split(r'[^A-Za-z0-9]+', path_template) if seg}
+    hit = segments & ADMIN_PATH_HINTS
+    if hit:
+        return f"admin path segment '{sorted(hit)[0]}'"
+
+    security = details.get('security', spec.get('security'))
+    if isinstance(security, list):
+        for requirement in security:
+            if not isinstance(requirement, dict):
+                continue
+            for scopes in requirement.values():
+                for scope in scopes or []:
+                    if isinstance(scope, str) and any(h in scope.lower() for h in ADMIN_SCOPE_HINTS):
+                        return f"privileged scope '{scope}'"
+    return None
+
 def apply_auth_finding(result, auth_schemes):
     """
     Records what the spec declares about auth on a result, and flags a 2xx from an
@@ -1371,6 +1401,7 @@ def test_endpoints(base_url, base_path, swagger_spec, verbose=False,
                 unique_endpoints.add(endpoint_key)
                 expected_types = declared_response_types(swagger_spec, details)
                 auth_schemes = required_auth_schemes(swagger_spec, details)
+                priv_reason = privileged_reason(path, swagger_spec, details)
 
                 parameters = merge_parameters(methods.get('parameters', []), details.get('parameters', []))
                 content_types = ['application/json']
@@ -1397,7 +1428,7 @@ def test_endpoints(base_url, base_path, swagger_spec, verbose=False,
                             verbose, include_all,
                             product_mode=product_mode, brute=brute
                         )
-                        future_to_endpoint[fut] = (mthd, path, ct, expected_types, auth_schemes)
+                        future_to_endpoint[fut] = (mthd, path, ct, expected_types, auth_schemes, priv_reason)
                 else:
                     # Swagger 2.0 with parameters
                     if parameters:
@@ -1413,10 +1444,10 @@ def test_endpoints(base_url, base_path, swagger_spec, verbose=False,
                         verbose, include_all,
                         product_mode=product_mode, brute=brute
                     )
-                    future_to_endpoint[fut] = (mthd, path, 'application/json', expected_types, auth_schemes)
+                    future_to_endpoint[fut] = (mthd, path, 'application/json', expected_types, auth_schemes, priv_reason)
 
         for future in as_completed(future_to_endpoint):
-            mthd, pth, ct, expected_types, auth_schemes = future_to_endpoint[future]
+            mthd, pth, ct, expected_types, auth_schemes, priv_reason = future_to_endpoint[future]
             try:
                 for res in future.result() or []:
                     reason = false_positive_reason(res, baselines, expected_types)
@@ -1426,6 +1457,7 @@ def test_endpoints(base_url, base_path, swagger_spec, verbose=False,
                             log(f"Discarding {res['method']} {res['url']}: {reason}", level="DEBUG")
                         continue
                     apply_auth_finding(res, auth_schemes)
+                    res['privileged_reason'] = priv_reason
                     all_results.append(res)
             except Exception as exc:
                 if verbose:
@@ -2121,6 +2153,92 @@ def test_idor(primary_results, identity_b, verbose=False):
                 log(f"IDOR: {tester.name} read {r['url']} (owned via {r['identity']})", level="WARNING")
     return findings
 
+def test_privesc(primary_results, low_priv_identity, verbose=False):
+    """
+    Privilege-escalation check. For each privileged endpoint the primary identity
+    (expected to be an admin) could read, re-requests the SAME url as the
+    lower-privilege identity and anonymously. A 2xx for them means the endpoint
+    did not enforce the privilege. GET only (re-reading is non-destructive).
+    Returns a list of finding dicts.
+    """
+    seen = set()
+    candidates = []
+    for r in primary_results:
+        if r['method'] != 'GET' or not (200 <= r['status_code'] < 300):
+            continue
+        if not r.get('privileged_reason') or not r.get('_body_hash'):
+            continue
+        if r['url'] in seen:
+            continue
+        seen.add(r['url'])
+        candidates.append(r)
+
+    if not candidates:
+        log("Privilege escalation: no privileged GET endpoints were accessible as the primary "
+            "(admin) identity; nothing to compare.", level="INFO")
+        return []
+
+    log(f"Privilege escalation: replaying {len(candidates)} privileged endpoint(s) as "
+        f"'{low_priv_identity.name}' and anonymous.", level="INFO")
+
+    testers = [low_priv_identity]
+    if low_priv_identity is not ANONYMOUS:
+        testers.append(ANONYMOUS)
+
+    findings = []
+    for r in candidates:
+        for tester in testers:
+            other = fetch_as(r['method'], r['url'], tester, verbose)
+            if not other or not (200 <= other['status_code'] < 300):
+                continue
+            same = other['body_hash'] == r['_body_hash']
+            anon = tester is ANONYMOUS
+            if same:
+                severity = 'critical' if anon else 'high'
+                detail = (f"Privilege escalation: '{tester.name}' received the same privileged "
+                          f"response as '{r['identity']}'")
+            else:
+                # Not rejected, but different body: worth manual review, lower confidence
+                severity = 'high' if anon else 'medium'
+                detail = (f"Privilege escalation: privileged endpoint returned "
+                          f"HTTP {other['status_code']} to '{tester.name}' (expected 401/403)")
+            findings.append({
+                'test': 'privesc',
+                'method': r['method'],
+                'url': r['url'],
+                'path_template': r['path_template'],
+                'privileged_reason': r['privileged_reason'],
+                'owner_identity': r['identity'],
+                'tested_as': tester.name,
+                'status_code': other['status_code'],
+                'content_length': other['content_length'],
+                'severity': severity,
+                'findings': [detail],
+            })
+            if verbose:
+                log(f"Privesc: {tester.name} reached {r['url']} ({r['privileged_reason']})", level="WARNING")
+    return findings
+
+def print_privesc_findings(privesc_findings):
+    """
+    Prints the privilege-escalation findings as their own table.
+    """
+    table = Table(title="Privilege Escalation Findings", show_lines=True)
+    table.add_column("Severity", no_wrap=True)
+    table.add_column("Method", style="cyan", no_wrap=True)
+    table.add_column("URL", style="magenta", overflow="fold")
+    table.add_column("Reached by", style="red", no_wrap=True)
+    table.add_column("Status", style="green", no_wrap=True)
+    table.add_column("Privileged because", overflow="fold")
+    for f in privesc_findings:
+        sev_style = SEVERITY_STYLES[f['severity']]
+        table.add_row(
+            f"[{sev_style}]{f['severity'].upper()}[/{sev_style}]",
+            f['method'], f['url'], f['tested_as'], str(f['status_code']),
+            escape(f['privileged_reason'] or ""),
+        )
+    output_console.print(table)
+
 def print_idor_findings(idor_findings):
     """
     Prints the IDOR/BOLA findings as their own table.
@@ -2140,7 +2258,7 @@ def print_idor_findings(idor_findings):
     output_console.print(table)
 
 def main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rate, brute, json_output,
-         output_file=None, identity=None, identity_b=None, idor=False):
+         output_file=None, identity=None, identity_b=None, idor=False, privesc=False):
     """
     Main function controlling flow:
     1. Tracks start time
@@ -2339,7 +2457,21 @@ def main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rat
         else:
             idor_findings = test_idor(all_results, identity_b, verbose)
 
-    # Internal field kept only for the IDOR comparison; strip before output
+    # Privilege escalation: replay the admin identity's privileged reads as the lower-privilege one
+    privesc_findings = []
+    if privesc:
+        if not scan_identity.authenticated:
+            log("Privilege escalation test skipped: scan as the admin identity "
+                "(-H/--token/--login).", level="WARNING")
+        else:
+            # Second identity is the lower-privilege user; fall back to anonymous if absent
+            low_priv = identity_b if (identity_b and identity_b.authenticated) else ANONYMOUS
+            if low_priv is ANONYMOUS:
+                log("Privilege escalation: no second identity given; testing anonymous access only.",
+                    level="INFO")
+            privesc_findings = test_privesc(all_results, low_priv, verbose)
+
+    # Internal field kept only for the IDOR/privesc comparison; strip before output
     for res in all_results:
         res.pop('_body_hash', None)
 
@@ -2387,6 +2519,8 @@ def main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rat
         output = {"results": clean_final_results}
         if idor_findings:
             output["idor_findings"] = idor_findings
+        if privesc_findings:
+            output["privesc_findings"] = privesc_findings
         if stats_flag:
             output["stats"] = stats
         output_console.print_json(data=output)
@@ -2418,6 +2552,8 @@ def main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rat
             out = {"results": final_results}
             if idor_findings:
                 out["idor_findings"] = idor_findings
+            if privesc_findings:
+                out["privesc_findings"] = privesc_findings
             if stats_flag:
                 out["stats"] = stats
             output_console.print_json(data=out)
@@ -2463,6 +2599,9 @@ def main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rat
         if idor_findings and not json_output:
             print_idor_findings(idor_findings)
 
+        if privesc_findings and not json_output:
+            print_privesc_findings(privesc_findings)
+
         if stats_flag and not json_output:
             stats_table = Table(title="Scan Statistics", show_lines=False)
             stats_table.add_column("Metric", style="cyan")
@@ -2484,6 +2623,7 @@ def main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rat
 
     stats["auth_required_endpoints"] = AUTH_REQUIRED_COUNT
     stats["idor_findings"] = len(idor_findings)
+    stats["privesc_findings"] = len(privesc_findings)
     # Nudge toward authenticated testing when anonymous and endpoints needed auth
     if not scan_identity.authenticated and AUTH_REQUIRED_COUNT > 0 and not product_mode:
         log(f"{AUTH_REQUIRED_COUNT} endpoint(s) returned 401/403 (authentication required). "
@@ -2493,8 +2633,8 @@ def main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rat
     # Save the full report (results + stats) as JSON if requested
     if output_file:
         with open(output_file, 'w') as f:
-            json.dump({"results": report_results, "idor_findings": idor_findings, "stats": stats},
-                      f, indent=2, default=str)
+            json.dump({"results": report_results, "idor_findings": idor_findings,
+                       "privesc_findings": privesc_findings, "stats": stats}, f, indent=2, default=str)
         log(f"Results written to {output_file}", level="INFO")
 
     # Writes any bad hosts to a file for reference
@@ -2548,6 +2688,9 @@ if __name__ == "__main__":
     idor.add_argument("--cookie2", metavar="STRING", help="Cookie for the second identity.")
     idor.add_argument("--token2", metavar="TOKEN", help="Bearer token for the second identity.")
     idor.add_argument("--auth-file2", metavar="FILE", help="Auth JSON file for the second identity.")
+    idor.add_argument("--privesc", action="store_true",
+                      help="Scan as the primary (admin) identity, then check whether the second "
+                           "identity or anonymous requests can reach privileged (admin) endpoints.")
 
     args = parser.parse_args()
 
@@ -2583,7 +2726,7 @@ if __name__ == "__main__":
         logger.propagate = False
 
     scan_identity = build_identity(args)
-    second_identity = build_second_identity(args) if args.idor else None
+    second_identity = build_second_identity(args) if (args.idor or args.privesc) else None
 
     main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rate, brute, json_output,
-         args.output, identity=scan_identity, identity_b=second_identity, idor=args.idor)
+         args.output, identity=scan_identity, identity_b=second_identity, idor=args.idor, privesc=args.privesc)
