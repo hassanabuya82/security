@@ -397,6 +397,11 @@ TEST_VALUES = {
 # Lock for thread-safe operations
 lock = threading.Lock()
 
+# Optional active-test probe collection (populated during the scan when enabled)
+ACTIVE_PROBES_ENABLED = False
+probe_targets = []
+probe_targets_lock = threading.Lock()
+
 # Initialize logger with RichHandler
 logger = logging.getLogger("autoswagger")
 logger.setLevel(logging.INFO)
@@ -641,6 +646,25 @@ def generate_query_string(parameters, value_mapping):
             if value is not None:
                 query_params[param_name] = value
     return urlencode(query_params)
+
+# Database error signatures that indicate an injected quote reached a SQL/ORM layer.
+# Detection only (like sqlmap/Burp error-based checks); no exploitation is attempted.
+SQL_ERROR_SIGNATURES = [
+    r"SQL syntax.*MySQL", r"Warning.*\bmysqli?_", r"MySqlException",
+    r"valid MySQL result", r"PostgreSQL.*ERROR", r"\bpg_(?:query|exec)\(",
+    r"PSQLException", r"SQLSTATE\[", r"Unclosed quotation mark after the character string",
+    r"Microsoft OLE DB Provider for SQL Server", r"ODBC SQL Server Driver",
+    r"ORA-\d{5}", r"Oracle error", r"SQLite3::", r"sqlite3\.OperationalError",
+    r"org\.hibernate\.QueryException", r"You have an error in your SQL syntax",
+    r"psycopg2\.", r"java\.sql\.SQLException",
+]
+COMPILED_SQL_ERRORS = [re.compile(p, re.IGNORECASE) for p in SQL_ERROR_SIGNATURES]
+
+def find_sql_errors(text):
+    """
+    Returns the names of any database error signatures present in a response body.
+    """
+    return [m.pattern for m in COMPILED_SQL_ERRORS if m.search(text)]
 
 def shannon_entropy(value):
     """
@@ -1112,6 +1136,17 @@ def test_parameter_values(method, base_url_no_path, full_path, parameters, reque
             continue
         value_mapping[param.get('name')] = param_values(param)[0]
 
+    # Record this GET endpoint for the optional injection pass (benign, non-destructive)
+    if ACTIVE_PROBES_ENABLED and method.upper() == 'GET' and any(
+            p.get('in') in ('path', 'query') for p in parameters):
+        with probe_targets_lock:
+            probe_targets.append({
+                'base_url_no_path': base_url_no_path,
+                'full_path': full_path,
+                'parameters': parameters,
+                'value_mapping': dict(value_mapping),
+            })
+
     # Default mode: one request
     if not brute:
         response = send_request(
@@ -1177,6 +1212,21 @@ def response_rank(result):
         result['content_length'],
     )
 
+def build_full_url(base_url_no_path, full_path, parameters, value_mapping):
+    """
+    Builds the absolute request URL from a path template, its parameters and a
+    value mapping (substituting path params and appending the query string).
+    """
+    substituted_path = substitute_path_parameters(full_path, parameters, value_mapping)
+    query_string = generate_query_string(parameters, value_mapping)
+    if not substituted_path.startswith('/'):
+        substituted_path = '/' + substituted_path
+    if urlparse(substituted_path).scheme in ['http', 'https']:
+        return substituted_path
+    if query_string:
+        return f"{urljoin(base_url_no_path, substituted_path)}?{query_string}"
+    return urljoin(base_url_no_path, substituted_path)
+
 def send_request(method, base_url_no_path, full_path, parameters, value_mapping, request_body, content_type, include_all, verbose):
     """
     Sends a request to the computed endpoint through the shared rate limiter.
@@ -1184,20 +1234,7 @@ def send_request(method, base_url_no_path, full_path, parameters, value_mapping,
     returns a dictionary summarizing the result (status code, content length, PII, etc.)
     Skips 401 and 403 responses by default.
     """
-    substituted_path = substitute_path_parameters(full_path, parameters, value_mapping)
-    query_string = generate_query_string(parameters, value_mapping)
-
-    if not substituted_path.startswith('/'):
-        substituted_path = '/' + substituted_path
-
-    parsed_path = urlparse(substituted_path)
-    if parsed_path.scheme in ['http', 'https']:
-        full_url = substituted_path
-    else:
-        if query_string:
-            full_url = f"{urljoin(base_url_no_path, substituted_path)}?{query_string}"
-        else:
-            full_url = urljoin(base_url_no_path, substituted_path)
+    full_url = build_full_url(base_url_no_path, full_path, parameters, value_mapping)
 
     headers = {'Content-Type': content_type} if content_type else {}
     data = request_body if method.upper() in ['POST', 'PUT', 'PATCH'] else None
@@ -2219,6 +2256,131 @@ def test_privesc(primary_results, low_priv_identity, verbose=False):
                 log(f"Privesc: {tester.name} reached {r['url']} ({r['privileged_reason']})", level="WARNING")
     return findings
 
+def fetch_text(url, verbose=False):
+    """
+    GETs a URL and returns (status_code, body_text, content_type), or None on error.
+    """
+    try:
+        resp = http_request('GET', url, allow_redirects=False)
+    except requests.exceptions.RequestException as e:
+        if verbose:
+            log(f"Injection probe {url} failed: {e}", level="DEBUG")
+        return None
+    return resp.status_code, resp.content.decode('utf-8', errors='ignore'), short_content_type(resp)
+
+def test_injection(verbose=False):
+    """
+    Sends benign marker probes to each GET parameter and looks for two indicators:
+    a database error triggered by an injected quote (possible SQL injection), and an
+    unencoded reflection of a unique marker in an HTML/JS response (possible XSS).
+    Non-destructive: it only reads, and never sends exploit payloads. Returns findings.
+    """
+    if not probe_targets:
+        log("Injection: no GET endpoints with parameters to probe.", level="INFO")
+        return []
+    log(f"Injection: probing parameters on {len(probe_targets)} GET endpoint(s).", level="INFO")
+
+    findings = []
+    seen = set()
+    for tgt in probe_targets:
+        params = tgt['parameters']
+        base_mapping = tgt['value_mapping']
+        for pname in list(base_mapping):
+            key = (tgt['full_path'], pname)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            baseline_val = base_mapping[pname]
+            baseline_url = build_full_url(tgt['base_url_no_path'], tgt['full_path'], params, base_mapping)
+            baseline = fetch_text(baseline_url, verbose)
+            baseline_text = baseline[1] if baseline else ""
+
+            # Error-based indicator: append a single quote and look for new DB errors
+            err_map = dict(base_mapping)
+            err_map[pname] = f"{baseline_val}'"
+            err = fetch_text(build_full_url(tgt['base_url_no_path'], tgt['full_path'], params, err_map), verbose)
+            if err:
+                new_errors = set(find_sql_errors(err[1])) - set(find_sql_errors(baseline_text))
+                if new_errors:
+                    findings.append({
+                        'test': 'injection', 'type': 'SQL error', 'severity': 'high',
+                        'url': baseline_url, 'parameter': pname, 'status_code': err[0],
+                        'findings': [f"Possible SQL injection: parameter '{pname}' triggered a "
+                                     f"database error when a quote was added"],
+                    })
+                    continue
+
+            # Reflection indicator: a unique marker with HTML specials, returned unencoded
+            marker = f"axzq{uuid.uuid4().hex[:8]}"
+            payload = f"{marker}\"'<x>"
+            refl_map = dict(base_mapping)
+            refl_map[pname] = payload
+            refl = fetch_text(build_full_url(tgt['base_url_no_path'], tgt['full_path'], params, refl_map), verbose)
+            if refl and f"{marker}\"'<x>" in refl[1] and ('html' in refl[2] or 'javascript' in refl[2]):
+                findings.append({
+                    'test': 'injection', 'type': 'reflected input', 'severity': 'medium',
+                    'url': baseline_url, 'parameter': pname, 'status_code': refl[0],
+                    'findings': [f"Reflected input: parameter '{pname}' is echoed unencoded into "
+                                 f"an {refl[2]} response (possible XSS)"],
+                })
+    return findings
+
+def test_rate_limit(url, burst=25, verbose=False):
+    """
+    Bounded rate-limit probe (not a flood): sends a small, fixed burst of GETs to one
+    URL, bypassing the configured rate limit, and reports whether the server throttled
+    (429/503). Returns a single finding dict, or None if the request could not run.
+    """
+    log(f"Rate-limit check: sending {burst} requests to {url}.", level="INFO")
+    saved_interval = rate_limiter.interval
+    rate_limiter.set_rate(0)  # the burst must not be self-throttled, or the test is meaningless
+    statuses = []
+    try:
+        with ThreadPoolExecutor(max_workers=min(burst, 20)) as ex:
+            def one(_):
+                try:
+                    return http_request('GET', url, allow_redirects=False).status_code
+                except requests.exceptions.RequestException:
+                    return None
+            statuses = [s for s in ex.map(one, range(burst)) if s is not None]
+    finally:
+        rate_limiter.interval = saved_interval
+
+    if not statuses:
+        log("Rate-limit check: no responses received.", level="WARNING")
+        return None
+    throttled = sum(1 for s in statuses if s in (429, 503))
+    limited = throttled > 0
+    return {
+        'test': 'rate_limit', 'url': url, 'requests_sent': len(statuses),
+        'throttled_responses': throttled,
+        'severity': 'info' if limited else 'low',
+        'findings': [f"{throttled}/{len(statuses)} requests were throttled (429/503)" if limited
+                     else f"No throttling after {len(statuses)} rapid requests — rate limiting "
+                          f"may be absent"],
+    }
+
+def print_simple_findings(title, findings, extra_col=None):
+    """
+    Prints a findings list (injection or rate-limit) as a table. extra_col is an
+    optional (header, key) pair for one more column.
+    """
+    table = Table(title=title, show_lines=True)
+    table.add_column("Severity", no_wrap=True)
+    table.add_column("URL", style="magenta", overflow="fold")
+    if extra_col:
+        table.add_column(extra_col[0], style="cyan", no_wrap=True)
+    table.add_column("Detail", overflow="fold")
+    for f in findings:
+        sev_style = SEVERITY_STYLES[f['severity']]
+        row = [f"[{sev_style}]{f['severity'].upper()}[/{sev_style}]", f['url']]
+        if extra_col:
+            row.append(escape(str(f.get(extra_col[1], ""))))
+        row.append(escape("; ".join(f['findings'])))
+        table.add_row(*row)
+    output_console.print(table)
+
 def print_privesc_findings(privesc_findings):
     """
     Prints the privilege-escalation findings as their own table.
@@ -2258,7 +2420,8 @@ def print_idor_findings(idor_findings):
     output_console.print(table)
 
 def main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rate, brute, json_output,
-         output_file=None, identity=None, identity_b=None, idor=False, privesc=False):
+         output_file=None, identity=None, identity_b=None, idor=False, privesc=False,
+         injection=False, rate_limit_check=False, rate_limit_burst=25):
     """
     Main function controlling flow:
     1. Tracks start time
@@ -2274,6 +2437,10 @@ def main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rat
     if identity is not None:
         set_active_identity(identity)
     scan_identity = active_identity
+
+    global ACTIVE_PROBES_ENABLED, probe_targets
+    ACTIVE_PROBES_ENABLED = injection
+    probe_targets = []
 
     all_results = []
     processed_urls = process_input(urls)
@@ -2475,6 +2642,21 @@ def main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rat
     for res in all_results:
         res.pop('_body_hash', None)
 
+    # Injection indicators (benign marker probes on GET parameters)
+    injection_findings = test_injection(verbose) if injection else []
+
+    # Bounded rate-limit probe against one representative GET endpoint
+    rate_limit_findings = []
+    if rate_limit_check:
+        target_url = next((r['url'] for r in all_results
+                           if r['method'] == 'GET' and 200 <= r['status_code'] < 300), None)
+        if target_url:
+            rl = test_rate_limit(target_url, burst=rate_limit_burst, verbose=verbose)
+            if rl:
+                rate_limit_findings.append(rl)
+        else:
+            log("Rate-limit check skipped: no successful GET endpoint to probe.", level="WARNING")
+
     SCAN_END_TIME = time.time()  # End the timer
     scan_duration = SCAN_END_TIME - SCAN_START_TIME
 
@@ -2521,6 +2703,10 @@ def main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rat
             output["idor_findings"] = idor_findings
         if privesc_findings:
             output["privesc_findings"] = privesc_findings
+        if injection_findings:
+            output["injection_findings"] = injection_findings
+        if rate_limit_findings:
+            output["rate_limit_findings"] = rate_limit_findings
         if stats_flag:
             output["stats"] = stats
         output_console.print_json(data=output)
@@ -2554,6 +2740,10 @@ def main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rat
                 out["idor_findings"] = idor_findings
             if privesc_findings:
                 out["privesc_findings"] = privesc_findings
+            if injection_findings:
+                out["injection_findings"] = injection_findings
+            if rate_limit_findings:
+                out["rate_limit_findings"] = rate_limit_findings
             if stats_flag:
                 out["stats"] = stats
             output_console.print_json(data=out)
@@ -2602,6 +2792,12 @@ def main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rat
         if privesc_findings and not json_output:
             print_privesc_findings(privesc_findings)
 
+        if injection_findings and not json_output:
+            print_simple_findings("Injection Findings", injection_findings, ("Parameter", "parameter"))
+
+        if rate_limit_findings and not json_output:
+            print_simple_findings("Rate-limit Check", rate_limit_findings)
+
         if stats_flag and not json_output:
             stats_table = Table(title="Scan Statistics", show_lines=False)
             stats_table.add_column("Metric", style="cyan")
@@ -2624,6 +2820,7 @@ def main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rat
     stats["auth_required_endpoints"] = AUTH_REQUIRED_COUNT
     stats["idor_findings"] = len(idor_findings)
     stats["privesc_findings"] = len(privesc_findings)
+    stats["injection_findings"] = len(injection_findings)
     # Nudge toward authenticated testing when anonymous and endpoints needed auth
     if not scan_identity.authenticated and AUTH_REQUIRED_COUNT > 0 and not product_mode:
         log(f"{AUTH_REQUIRED_COUNT} endpoint(s) returned 401/403 (authentication required). "
@@ -2634,7 +2831,9 @@ def main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rat
     if output_file:
         with open(output_file, 'w') as f:
             json.dump({"results": report_results, "idor_findings": idor_findings,
-                       "privesc_findings": privesc_findings, "stats": stats}, f, indent=2, default=str)
+                       "privesc_findings": privesc_findings, "injection_findings": injection_findings,
+                       "rate_limit_findings": rate_limit_findings, "stats": stats},
+                      f, indent=2, default=str)
         log(f"Results written to {output_file}", level="INFO")
 
     # Writes any bad hosts to a file for reference
@@ -2692,7 +2891,18 @@ if __name__ == "__main__":
                       help="Scan as the primary (admin) identity, then check whether the second "
                            "identity or anonymous requests can reach privileged (admin) endpoints.")
 
+    active = parser.add_argument_group("active testing (use only with authorization)")
+    active.add_argument("--injection", action="store_true",
+                        help="Probe GET parameters for SQL-error and reflected-input (XSS) indicators "
+                             "using benign markers. Reads only; no exploit payloads.")
+    active.add_argument("--rate-limit-check", action="store_true",
+                        help="Send a small, bounded burst to one endpoint and report whether the "
+                             "server throttles (429/503).")
+    active.add_argument("--rate-limit-burst", type=int, default=25, metavar="N",
+                        help="Number of requests in the rate-limit burst (default: 25, max: 200).")
+
     args = parser.parse_args()
+    args.rate_limit_burst = max(1, min(args.rate_limit_burst, 200))
 
     if not args.urls and not sys.stdin.isatty():
         urls = [line.strip() for line in sys.stdin if line.strip()]
@@ -2729,4 +2939,5 @@ if __name__ == "__main__":
     second_identity = build_second_identity(args) if (args.idor or args.privesc) else None
 
     main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rate, brute, json_output,
-         args.output, identity=scan_identity, identity_b=second_identity, idor=args.idor, privesc=args.privesc)
+         args.output, identity=scan_identity, identity_b=second_identity, idor=args.idor, privesc=args.privesc,
+         injection=args.injection, rate_limit_check=args.rate_limit_check, rate_limit_burst=args.rate_limit_burst)

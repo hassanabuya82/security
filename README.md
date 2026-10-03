@@ -107,6 +107,9 @@ By default it scans **unauthenticated**. When endpoints return 401/403, it repor
 | `--idor`             | After scanning as the primary identity, replay object reads as a second identity and anonymously; flag cross-user access (BOLA/IDOR). |
 | `--header2 / --cookie2 / --token2 / --auth-file2` | Credentials for the second identity used by `--idor`.                            |
 | `--privesc`          | Scan as the primary (admin) identity, then check whether the second identity or anonymous requests can reach privileged (admin) endpoints. |
+| `--injection`        | Probe GET parameters for SQL-error and reflected-input (XSS) indicators using benign markers. |
+| `--rate-limit-check` | Send a small bounded burst to one endpoint and report whether it throttles (429/503). |
+| `--rate-limit-burst N` | Requests in the rate-limit burst (default 25, max 200). |
 
 
 ## Help
@@ -252,6 +255,13 @@ Run as the **admin** identity with a lower-privilege second identity. Autoswagge
 ```bash
 python3 autoswagger.py https://api.example.com --token "$ADMIN_TOKEN" --privesc --token2 "$USER_TOKEN"
 ```
+
+### Active testing (`--injection`, `--rate-limit-check`)
+
+These send crafted requests, so use them only against systems you are authorized to test.
+
+- **`--injection`** probes each GET parameter with two benign markers: a single quote (and looks for a *new* database error in the response — a SQL-injection indicator) and a unique string with HTML special characters (and looks for it reflected unencoded in an HTML/JS response — an XSS indicator). It reads only and sends no exploit payloads; findings are indicators to confirm manually.
+- **`--rate-limit-check`** sends a small bounded burst (`--rate-limit-burst`, default 25) to one endpoint and reports whether the server throttled. It is a configuration check, not a load test.
 
 ---
 
