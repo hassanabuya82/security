@@ -110,6 +110,7 @@ By default it scans **unauthenticated**. When endpoints return 401/403, it repor
 | `--injection`        | Probe GET parameters for SQL-error and reflected-input (XSS) indicators using benign markers. |
 | `--rate-limit-check` | Send a small bounded burst to one endpoint and report whether it throttles (429/503). |
 | `--rate-limit-burst N` | Requests in the rate-limit burst (default 25, max 200). |
+| `--jwt`              | Analyze supplied bearer token(s) for weak JWT settings and test whether the server verifies the signature. |
 
 
 ## Help
@@ -262,6 +263,7 @@ These send crafted requests, so use them only against systems you are authorized
 
 - **`--injection`** probes each GET parameter with two benign markers: a single quote (and looks for a *new* database error in the response — a SQL-injection indicator) and a unique string with HTML special characters (and looks for it reflected unencoded in an HTML/JS response — an XSS indicator). It reads only and sends no exploit payloads; findings are indicators to confirm manually.
 - **`--rate-limit-check`** sends a small bounded burst (`--rate-limit-burst`, default 25) to one endpoint and reports whether the server throttled. It is a configuration check, not a load test.
+- **`--jwt`** inspects any bearer token you supply (offline, no requests): it flags `alg: none`, symmetric algorithms, a missing or very long expiry, and PII/secrets carried in the payload. It then re-requests one protected endpoint with tampered tokens (an `alg:none` variant, a stripped signature, a corrupted signature); if the server accepts any of them, the signature is not being verified (`CRITICAL`).
 
 ---
 

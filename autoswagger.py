@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # Autoswagger - Cale Anderson @ Intruder    
 import argparse
+import base64
 import hashlib
 import getpass
 import json
@@ -2256,6 +2257,127 @@ def test_privesc(primary_results, low_priv_identity, verbose=False):
                 log(f"Privesc: {tester.name} reached {r['url']} ({r['privileged_reason']})", level="WARNING")
     return findings
 
+def b64url_decode_json(segment):
+    """
+    Decodes a base64url JWT segment into a dict, or None if it isn't valid JSON.
+    """
+    try:
+        padded = segment + '=' * (-len(segment) % 4)
+        return json.loads(base64.urlsafe_b64decode(padded.encode()))
+    except (ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+def decode_jwt(token):
+    """
+    Splits a JWT and decodes its header and payload without verifying the
+    signature. Returns (header, payload, parts) or None if it isn't a JWT.
+    """
+    parts = token.split('.')
+    if len(parts) != 3:
+        return None
+    header = b64url_decode_json(parts[0])
+    payload = b64url_decode_json(parts[1])
+    if not isinstance(header, dict) or not isinstance(payload, dict):
+        return None
+    return header, payload, parts
+
+def bearer_token(identity):
+    """
+    Returns the bearer token from an identity's Authorization header, or None.
+    """
+    value = identity.headers.get('Authorization', '') if identity else ''
+    if value.lower().startswith('bearer '):
+        return value[7:].strip()
+    return None
+
+def analyze_jwt(token, label):
+    """
+    Offline hygiene checks on a JWT: 'alg: none', symmetric alg, missing or long
+    expiry, and sensitive data (PII/secrets) carried in the payload. No network,
+    no signature verification. Returns a list of finding dicts.
+    """
+    decoded = decode_jwt(token)
+    if not decoded:
+        return []
+    header, payload, _ = decoded
+    alg = str(header.get('alg', '')).lower()
+    findings = []
+
+    def add(severity, detail):
+        findings.append({'test': 'jwt', 'identity': label, 'severity': severity, 'findings': [detail]})
+
+    if alg == 'none':
+        add('critical', f"{label}: JWT header uses 'alg: none' — the signature can be stripped")
+    elif alg.startswith('hs'):
+        add('low', f"{label}: JWT uses symmetric {header.get('alg')} — vulnerable if the signing secret is weak")
+
+    now = time.time()
+    exp = payload.get('exp')
+    if exp is None:
+        add('medium', f"{label}: JWT has no 'exp' claim — the token does not expire")
+    elif isinstance(exp, (int, float)):
+        if exp < now:
+            add('info', f"{label}: JWT is expired")
+        else:
+            iat = payload.get('iat')
+            lifetime = (exp - iat) if isinstance(iat, (int, float)) else (exp - now)
+            if lifetime > 30 * 24 * 3600:
+                add('low', f"{label}: JWT lifetime is very long (~{int(lifetime // 86400)} days)")
+
+    payload_text = json.dumps(payload)
+    if detect_pii(payload_text):
+        add('medium', f"{label}: JWT payload contains PII")
+    secrets, _ = detect_sensitive_info(payload_text)
+    if secrets:
+        add('high', f"{label}: JWT payload contains a secret ({', '.join(secrets)})")
+    return findings
+
+def tampered_tokens(parts):
+    """
+    Yields (name, token) pairs of non-destructive tampered variants used to check
+    whether the server actually verifies the signature: an 'alg: none' token with
+    the same claims, the original claims with the signature removed, and the token
+    with its signature corrupted.
+    """
+    header, payload = parts[0], parts[1]
+    none_header = base64.urlsafe_b64encode(b'{"alg":"none","typ":"JWT"}').decode().rstrip('=')
+    yield ("alg:none", f"{none_header}.{payload}.")
+    yield ("stripped signature", f"{header}.{payload}.")
+    corrupt = parts[2][:-1] + ('A' if parts[2][-1:] != 'A' else 'B') if parts[2] else 'AAAA'
+    yield ("corrupted signature", f"{header}.{payload}.{corrupt}")
+
+def test_jwt(identity, identity_b, all_results, verbose=False):
+    """
+    JWT token checks. Runs offline hygiene analysis on each identity's bearer token,
+    then, if a protected GET endpoint was read successfully, re-requests it with
+    tampered tokens (GET only). A 2xx whose body matches the original means the
+    signature is not being verified. Returns a list of finding dicts.
+    """
+    findings = []
+    for ident in [identity, identity_b]:
+        token = bearer_token(ident)
+        if token:
+            findings.extend(analyze_jwt(token, ident.name))
+
+    token = bearer_token(identity)
+    parts = token.split('.') if token else []
+    if len(parts) == 3:
+        target = next((r for r in all_results
+                       if r['method'] == 'GET' and 200 <= r['status_code'] < 300 and r.get('_body_hash')), None)
+        if target:
+            log(f"JWT: testing token verification against {target['url']}.", level="INFO")
+            for name, bad_token in tampered_tokens(parts):
+                probe = Identity("jwt-probe", {'Authorization': f"Bearer {bad_token}"})
+                other = fetch_as('GET', target['url'], probe, verbose)
+                if other and 200 <= other['status_code'] < 300 and other['body_hash'] == target['_body_hash']:
+                    findings.append({
+                        'test': 'jwt', 'identity': identity.name, 'severity': 'critical',
+                        'url': target['url'],
+                        'findings': [f"Signature not verified: a token with a {name} was accepted "
+                                     f"(same response) at {urlparse(target['url']).path}"],
+                    })
+    return findings
+
 def fetch_text(url, verbose=False):
     """
     GETs a URL and returns (status_code, body_text, content_type), or None on error.
@@ -2421,7 +2543,7 @@ def print_idor_findings(idor_findings):
 
 def main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rate, brute, json_output,
          output_file=None, identity=None, identity_b=None, idor=False, privesc=False,
-         injection=False, rate_limit_check=False, rate_limit_burst=25):
+         injection=False, rate_limit_check=False, rate_limit_burst=25, jwt=False):
     """
     Main function controlling flow:
     1. Tracks start time
@@ -2638,7 +2760,10 @@ def main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rat
                     level="INFO")
             privesc_findings = test_privesc(all_results, low_priv, verbose)
 
-    # Internal field kept only for the IDOR/privesc comparison; strip before output
+    # JWT token hygiene (offline) + signature-verification check (GET only)
+    jwt_findings = test_jwt(scan_identity, identity_b, all_results, verbose) if jwt else []
+
+    # Internal field kept only for the IDOR/privesc/JWT comparison; strip before output
     for res in all_results:
         res.pop('_body_hash', None)
 
@@ -2707,6 +2832,8 @@ def main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rat
             output["injection_findings"] = injection_findings
         if rate_limit_findings:
             output["rate_limit_findings"] = rate_limit_findings
+        if jwt_findings:
+            output["jwt_findings"] = jwt_findings
         if stats_flag:
             output["stats"] = stats
         output_console.print_json(data=output)
@@ -2744,6 +2871,8 @@ def main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rat
                 out["injection_findings"] = injection_findings
             if rate_limit_findings:
                 out["rate_limit_findings"] = rate_limit_findings
+            if jwt_findings:
+                out["jwt_findings"] = jwt_findings
             if stats_flag:
                 out["stats"] = stats
             output_console.print_json(data=out)
@@ -2798,6 +2927,9 @@ def main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rat
         if rate_limit_findings and not json_output:
             print_simple_findings("Rate-limit Check", rate_limit_findings)
 
+        if jwt_findings and not json_output:
+            print_simple_findings("JWT / Token Findings", jwt_findings, ("Identity", "identity"))
+
         if stats_flag and not json_output:
             stats_table = Table(title="Scan Statistics", show_lines=False)
             stats_table.add_column("Metric", style="cyan")
@@ -2821,6 +2953,7 @@ def main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rat
     stats["idor_findings"] = len(idor_findings)
     stats["privesc_findings"] = len(privesc_findings)
     stats["injection_findings"] = len(injection_findings)
+    stats["jwt_findings"] = len(jwt_findings)
     # Nudge toward authenticated testing when anonymous and endpoints needed auth
     if not scan_identity.authenticated and AUTH_REQUIRED_COUNT > 0 and not product_mode:
         log(f"{AUTH_REQUIRED_COUNT} endpoint(s) returned 401/403 (authentication required). "
@@ -2832,8 +2965,8 @@ def main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rat
         with open(output_file, 'w') as f:
             json.dump({"results": report_results, "idor_findings": idor_findings,
                        "privesc_findings": privesc_findings, "injection_findings": injection_findings,
-                       "rate_limit_findings": rate_limit_findings, "stats": stats},
-                      f, indent=2, default=str)
+                       "rate_limit_findings": rate_limit_findings, "jwt_findings": jwt_findings,
+                       "stats": stats}, f, indent=2, default=str)
         log(f"Results written to {output_file}", level="INFO")
 
     # Writes any bad hosts to a file for reference
@@ -2900,6 +3033,9 @@ if __name__ == "__main__":
                              "server throttles (429/503).")
     active.add_argument("--rate-limit-burst", type=int, default=25, metavar="N",
                         help="Number of requests in the rate-limit burst (default: 25, max: 200).")
+    active.add_argument("--jwt", action="store_true",
+                        help="Analyze the supplied bearer token(s) for weak JWT settings and check "
+                             "whether the server verifies the signature (accepts a tampered token).")
 
     args = parser.parse_args()
     args.rate_limit_burst = max(1, min(args.rate_limit_burst, 200))
@@ -2940,4 +3076,5 @@ if __name__ == "__main__":
 
     main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rate, brute, json_output,
          args.output, identity=scan_identity, identity_b=second_identity, idor=args.idor, privesc=args.privesc,
-         injection=args.injection, rate_limit_check=args.rate_limit_check, rate_limit_burst=args.rate_limit_burst)
+         injection=args.injection, rate_limit_check=args.rate_limit_check,
+         rate_limit_burst=args.rate_limit_burst, jwt=args.jwt)
