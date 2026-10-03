@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 # Autoswagger - Cale Anderson @ Intruder    
 import argparse
+import base64
 import hashlib
+import getpass
 import json
 import math
 import os
@@ -38,6 +40,7 @@ import logging
 # Global Variables for Stats
 # ------------------------------
 TOTAL_REQUESTS = 0       # Tracks total requests sent by the tool
+AUTH_REQUIRED_COUNT = 0  # Endpoints that answered 401/403 (i.e. require auth)
 SCAN_START_TIME = 0.0    # Records scan start time (for RPS calculation)
 SCAN_END_TIME = 0.0      # Records scan end time (for RPS calculation)
 
@@ -208,15 +211,55 @@ def retry_after_seconds(response, attempt):
         delay = 2 ** attempt
     return min(delay, MAX_RETRY_DELAY)
 
-def http_request(method, url, **kwargs):
+class Identity:
+    """
+    A named set of credentials attached to requests: HTTP headers (which may
+    include Authorization and Cookie). The anonymous identity has no headers.
+    """
+    def __init__(self, name="anonymous", headers=None):
+        self.name = name
+        self.headers = headers or {}
+
+    @property
+    def authenticated(self):
+        return bool(self.headers)
+
+    def __repr__(self):
+        return f"Identity({self.name!r}, {len(self.headers)} header(s))"
+
+# The identity used for the current scan. Replaced once, before scanning starts,
+# so every worker thread reads the same one.
+ANONYMOUS = Identity()
+active_identity = ANONYMOUS
+
+def set_active_identity(identity):
+    global active_identity
+    active_identity = identity
+
+def parse_header_arg(raw):
+    """
+    Parses a 'Name: value' CLI/file header into (name, value). Raises ValueError
+    if there is no colon.
+    """
+    if ':' not in raw:
+        raise ValueError(f"header must be in 'Name: value' form, got: {raw!r}")
+    name, _, value = raw.partition(':')
+    return name.strip(), value.strip()
+
+def http_request(method, url, identity=None, **kwargs):
     """
     Sends a request through the shared rate limiter and this thread's session.
+    The active identity's auth headers are attached (per-call headers win on a clash).
     429 and 503 are retried for any method (the server didn't process them);
     502 and 504 only for safe methods. Every attempt counts toward TOTAL_REQUESTS.
     """
     global TOTAL_REQUESTS
     kwargs.setdefault('timeout', TIMEOUT)
     safe_method = method.upper() in ('GET', 'HEAD', 'OPTIONS')
+
+    identity = identity if identity is not None else active_identity
+    if identity.headers:
+        kwargs['headers'] = {**identity.headers, **(kwargs.get('headers') or {})}
 
     for attempt in range(MAX_RETRIES + 1):
         rate_limiter.wait()
@@ -354,6 +397,11 @@ TEST_VALUES = {
 
 # Lock for thread-safe operations
 lock = threading.Lock()
+
+# Optional active-test probe collection (populated during the scan when enabled)
+ACTIVE_PROBES_ENABLED = False
+probe_targets = []
+probe_targets_lock = threading.Lock()
 
 # Initialize logger with RichHandler
 logger = logging.getLogger("autoswagger")
@@ -599,6 +647,25 @@ def generate_query_string(parameters, value_mapping):
             if value is not None:
                 query_params[param_name] = value
     return urlencode(query_params)
+
+# Database error signatures that indicate an injected quote reached a SQL/ORM layer.
+# Detection only (like sqlmap/Burp error-based checks); no exploitation is attempted.
+SQL_ERROR_SIGNATURES = [
+    r"SQL syntax.*MySQL", r"Warning.*\bmysqli?_", r"MySqlException",
+    r"valid MySQL result", r"PostgreSQL.*ERROR", r"\bpg_(?:query|exec)\(",
+    r"PSQLException", r"SQLSTATE\[", r"Unclosed quotation mark after the character string",
+    r"Microsoft OLE DB Provider for SQL Server", r"ODBC SQL Server Driver",
+    r"ORA-\d{5}", r"Oracle error", r"SQLite3::", r"sqlite3\.OperationalError",
+    r"org\.hibernate\.QueryException", r"You have an error in your SQL syntax",
+    r"psycopg2\.", r"java\.sql\.SQLException",
+]
+COMPILED_SQL_ERRORS = [re.compile(p, re.IGNORECASE) for p in SQL_ERROR_SIGNATURES]
+
+def find_sql_errors(text):
+    """
+    Returns the names of any database error signatures present in a response body.
+    """
+    return [m.pattern for m in COMPILED_SQL_ERRORS if m.search(text)]
 
 def shannon_entropy(value):
     """
@@ -997,6 +1064,36 @@ def required_auth_schemes(spec, details):
             schemes.extend(name for name in req if name not in schemes)
     return schemes
 
+# Path segments and scope/role words that mark an endpoint as privileged
+ADMIN_PATH_HINTS = {
+    "admin", "admins", "administrator", "administration", "superuser", "superadmin",
+    "root", "manage", "management", "manager", "internal", "console", "backoffice",
+    "sysadmin", "privileged", "moderator", "staff", "operator",
+}
+ADMIN_SCOPE_HINTS = ("admin", "superuser", "manage", "write:admin", "root", "sudo", "elevated")
+
+def privileged_reason(path_template, spec, details):
+    """
+    Returns a short reason if an endpoint looks privileged (admin-only), else None.
+    Two signals: an admin-like path segment, or a security scope/role that implies
+    elevated access.
+    """
+    segments = {seg.lower() for seg in re.split(r'[^A-Za-z0-9]+', path_template) if seg}
+    hit = segments & ADMIN_PATH_HINTS
+    if hit:
+        return f"admin path segment '{sorted(hit)[0]}'"
+
+    security = details.get('security', spec.get('security'))
+    if isinstance(security, list):
+        for requirement in security:
+            if not isinstance(requirement, dict):
+                continue
+            for scopes in requirement.values():
+                for scope in scopes or []:
+                    if isinstance(scope, str) and any(h in scope.lower() for h in ADMIN_SCOPE_HINTS):
+                        return f"privileged scope '{scope}'"
+    return None
+
 def apply_auth_finding(result, auth_schemes):
     """
     Records what the spec declares about auth on a result, and flags a 2xx from an
@@ -1039,6 +1136,17 @@ def test_parameter_values(method, base_url_no_path, full_path, parameters, reque
         if param.get('in') not in ['path', 'query']:
             continue
         value_mapping[param.get('name')] = param_values(param)[0]
+
+    # Record this GET endpoint for the optional injection pass (benign, non-destructive)
+    if ACTIVE_PROBES_ENABLED and method.upper() == 'GET' and any(
+            p.get('in') in ('path', 'query') for p in parameters):
+        with probe_targets_lock:
+            probe_targets.append({
+                'base_url_no_path': base_url_no_path,
+                'full_path': full_path,
+                'parameters': parameters,
+                'value_mapping': dict(value_mapping),
+            })
 
     # Default mode: one request
     if not brute:
@@ -1105,6 +1213,21 @@ def response_rank(result):
         result['content_length'],
     )
 
+def build_full_url(base_url_no_path, full_path, parameters, value_mapping):
+    """
+    Builds the absolute request URL from a path template, its parameters and a
+    value mapping (substituting path params and appending the query string).
+    """
+    substituted_path = substitute_path_parameters(full_path, parameters, value_mapping)
+    query_string = generate_query_string(parameters, value_mapping)
+    if not substituted_path.startswith('/'):
+        substituted_path = '/' + substituted_path
+    if urlparse(substituted_path).scheme in ['http', 'https']:
+        return substituted_path
+    if query_string:
+        return f"{urljoin(base_url_no_path, substituted_path)}?{query_string}"
+    return urljoin(base_url_no_path, substituted_path)
+
 def send_request(method, base_url_no_path, full_path, parameters, value_mapping, request_body, content_type, include_all, verbose):
     """
     Sends a request to the computed endpoint through the shared rate limiter.
@@ -1112,20 +1235,7 @@ def send_request(method, base_url_no_path, full_path, parameters, value_mapping,
     returns a dictionary summarizing the result (status code, content length, PII, etc.)
     Skips 401 and 403 responses by default.
     """
-    substituted_path = substitute_path_parameters(full_path, parameters, value_mapping)
-    query_string = generate_query_string(parameters, value_mapping)
-
-    if not substituted_path.startswith('/'):
-        substituted_path = '/' + substituted_path
-
-    parsed_path = urlparse(substituted_path)
-    if parsed_path.scheme in ['http', 'https']:
-        full_url = substituted_path
-    else:
-        if query_string:
-            full_url = f"{urljoin(base_url_no_path, substituted_path)}?{query_string}"
-        else:
-            full_url = urljoin(base_url_no_path, substituted_path)
+    full_url = build_full_url(base_url_no_path, full_path, parameters, value_mapping)
 
     headers = {'Content-Type': content_type} if content_type else {}
     data = request_body if method.upper() in ['POST', 'PUT', 'PATCH'] else None
@@ -1136,8 +1246,12 @@ def send_request(method, base_url_no_path, full_path, parameters, value_mapping,
         )
         status_code = response.status_code
 
-        # Skip 401 and 403 by design
+        # Skip 401 and 403 by design, but count them: they mark endpoints that
+        # require authentication, which drives the "rerun with --login" hint
         if status_code in [401, 403]:
+            global AUTH_REQUIRED_COUNT
+            with request_count_lock:
+                AUTH_REQUIRED_COUNT += 1
             if verbose:
                 log(f"Skipping endpoint {method.upper()} {full_url} due to status code {status_code}", level="INFO")
             return None
@@ -1178,6 +1292,7 @@ def send_request(method, base_url_no_path, full_path, parameters, value_mapping,
             "method": method.upper(),
             "url": full_url,
             "path_template": full_path,
+            "identity": active_identity.name,
             "body": data if data else "",
             "status_code": status_code,
             "content_type": short_content_type(response),
@@ -1324,6 +1439,7 @@ def test_endpoints(base_url, base_path, swagger_spec, verbose=False,
                 unique_endpoints.add(endpoint_key)
                 expected_types = declared_response_types(swagger_spec, details)
                 auth_schemes = required_auth_schemes(swagger_spec, details)
+                priv_reason = privileged_reason(path, swagger_spec, details)
 
                 parameters = merge_parameters(methods.get('parameters', []), details.get('parameters', []))
                 content_types = ['application/json']
@@ -1350,7 +1466,7 @@ def test_endpoints(base_url, base_path, swagger_spec, verbose=False,
                             verbose, include_all,
                             product_mode=product_mode, brute=brute
                         )
-                        future_to_endpoint[fut] = (mthd, path, ct, expected_types, auth_schemes)
+                        future_to_endpoint[fut] = (mthd, path, ct, expected_types, auth_schemes, priv_reason)
                 else:
                     # Swagger 2.0 with parameters
                     if parameters:
@@ -1366,10 +1482,10 @@ def test_endpoints(base_url, base_path, swagger_spec, verbose=False,
                         verbose, include_all,
                         product_mode=product_mode, brute=brute
                     )
-                    future_to_endpoint[fut] = (mthd, path, 'application/json', expected_types, auth_schemes)
+                    future_to_endpoint[fut] = (mthd, path, 'application/json', expected_types, auth_schemes, priv_reason)
 
         for future in as_completed(future_to_endpoint):
-            mthd, pth, ct, expected_types, auth_schemes = future_to_endpoint[future]
+            mthd, pth, ct, expected_types, auth_schemes, priv_reason = future_to_endpoint[future]
             try:
                 for res in future.result() or []:
                     reason = false_positive_reason(res, baselines, expected_types)
@@ -1379,6 +1495,7 @@ def test_endpoints(base_url, base_path, swagger_spec, verbose=False,
                             log(f"Discarding {res['method']} {res['url']}: {reason}", level="DEBUG")
                         continue
                     apply_auth_finding(res, auth_schemes)
+                    res['privileged_reason'] = priv_reason
                     all_results.append(res)
             except Exception as exc:
                 if verbose:
@@ -1404,8 +1521,7 @@ def test_endpoints(base_url, base_path, swagger_spec, verbose=False,
 
     if filtered_count and not product_mode:
         log(f"Discarded {filtered_count} catch-all/soft-404 response(s) for {base_url}.", level="INFO")
-    for res in all_results:
-        res.pop('_body_hash', None)
+    # _body_hash is kept here (used by the IDOR test) and stripped in main before output
     return all_results
 
 def resolve_refs(spec):
@@ -1832,7 +1948,602 @@ def process_input(urls):
         processed.append(url)
     return processed
 
-def main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rate, brute, json_output, output_file=None):
+def dig(data, dotted_path):
+    """
+    Follows a dotted path into nested dicts/lists, e.g. 'data.token' or
+    'items.0.key'. Returns None if any step is missing.
+    """
+    node = data
+    for part in dotted_path.split('.'):
+        if isinstance(node, dict) and part in node:
+            node = node[part]
+        elif isinstance(node, list) and part.lstrip('-').isdigit() and -len(node) <= int(part) < len(node):
+            node = node[int(part)]
+        else:
+            return None
+    return node
+
+def headers_from_sources(header_args=None, cookie=None, token=None, auth_file=None):
+    """
+    Builds a header dict from CLI/file inputs: repeated 'Name: value' headers,
+    a Cookie string, a bearer token, and a JSON file of {"headers": {...},
+    "cookie": "...", "token": "..."}. Later sources merge over earlier ones.
+    """
+    headers = {}
+    if auth_file:
+        with open(auth_file) as f:
+            data = json.load(f)
+        headers.update(data.get('headers') or {})
+        if data.get('cookie'):
+            headers['Cookie'] = data['cookie']
+        if data.get('token'):
+            headers['Authorization'] = f"Bearer {data['token']}"
+    for raw in header_args or []:
+        name, value = parse_header_arg(raw)
+        headers[name] = value
+    if cookie:
+        headers['Cookie'] = cookie
+    if token:
+        headers['Authorization'] = f"Bearer {token}"
+    return headers
+
+def login_for_token(login_url, login_data, token_path="token",
+                    token_header="Authorization", token_prefix="Bearer ", verbose=False):
+    """
+    Exchanges credentials for a token: POSTs login_data as JSON to login_url,
+    reads the token at token_path from the JSON response, and returns it as a
+    header dict. Returns None on failure.
+    """
+    try:
+        resp = http_request('POST', login_url, identity=ANONYMOUS,
+                            json=login_data, allow_redirects=False)
+    except requests.exceptions.RequestException as e:
+        log(f"Login request to {login_url} failed: {e}", level="CRITICAL")
+        return None
+    if not 200 <= resp.status_code < 300:
+        log(f"Login failed: {login_url} returned {resp.status_code}", level="CRITICAL")
+        return None
+    try:
+        token = dig(resp.json(), token_path)
+    except ValueError:
+        token = None
+    if not token:
+        log(f"Login succeeded but no token at '{token_path}' in the response.", level="CRITICAL")
+        return None
+    if verbose:
+        log(f"Obtained token from {login_url} (path '{token_path}').", level="SUCCESS")
+    return {token_header: f"{token_prefix}{token}"}
+
+def prompt_for_identity(name="user"):
+    """
+    Interactively collects credentials for one identity. Offers a raw
+    token/header/cookie, or a username+password login against a login endpoint.
+    Returns an Identity, or the anonymous one if the user supplies nothing.
+    """
+    console.print(f"\n[bold]Enter credentials for identity '{name}'[/bold] "
+                  "(press Enter to skip a field).")
+    console.print("  [1] Bearer token   [2] Raw header   [3] Cookie   "
+                  "[4] Username/password login")
+    choice = input("Method [1-4, default 1]: ").strip() or "1"
+
+    try:
+        if choice == "2":
+            raw = input("Header (Name: value): ").strip()
+            headers = dict([parse_header_arg(raw)]) if raw else {}
+        elif choice == "3":
+            cookie = input("Cookie string: ").strip()
+            headers = {'Cookie': cookie} if cookie else {}
+        elif choice == "4":
+            login_url = input("Login URL: ").strip()
+            user_field = input("Username field name [username]: ").strip() or "username"
+            pass_field = input("Password field name [password]: ").strip() or "password"
+            username = input("Username: ").strip()
+            password = getpass.getpass("Password: ")
+            token_path = input("Token path in response [token]: ").strip() or "token"
+            headers = login_for_token(
+                login_url, {user_field: username, pass_field: password},
+                token_path=token_path, verbose=True
+            ) or {}
+        else:
+            token = getpass.getpass("Bearer token: ").strip()
+            headers = {'Authorization': f"Bearer {token}"} if token else {}
+    except (ValueError, KeyboardInterrupt) as e:
+        log(f"Credential entry cancelled: {e}", level="WARNING")
+        headers = {}
+
+    if not headers:
+        log(f"No credentials entered for '{name}'; continuing anonymously.", level="WARNING")
+        return ANONYMOUS
+    return Identity(name, headers)
+
+def build_identity(args):
+    """
+    Assembles the scan identity from CLI args: flags/file/login first, then an
+    interactive prompt if --login was given (or the inputs were incomplete).
+    Returns an Identity (anonymous if nothing was provided).
+    """
+    headers = headers_from_sources(args.header, args.cookie, args.token, args.auth_file)
+
+    if args.login_url and not headers:
+        if not args.login_data:
+            log("--login-url needs --login-data (JSON credentials).", level="CRITICAL")
+        else:
+            try:
+                creds = json.loads(args.login_data)
+            except ValueError:
+                log("--login-data must be valid JSON.", level="CRITICAL")
+                creds = None
+            if creds:
+                headers = login_for_token(args.login_url, creds,
+                                          token_path=args.token_path, verbose=args.verbose) or {}
+
+    if args.login and not headers:
+        if sys.stdin.isatty():
+            return prompt_for_identity("user")
+        log("--login needs an interactive terminal; use -H/--token/--auth-file instead.", level="CRITICAL")
+
+    return Identity("user", headers) if headers else ANONYMOUS
+
+def build_second_identity(args):
+    """
+    Assembles the second identity for the IDOR test from the *2 flags, or an
+    interactive prompt (when --login is set and a terminal is available).
+    Returns an Identity, or the anonymous one if nothing was provided.
+    """
+    headers = headers_from_sources(args.header2, args.cookie2, args.token2, args.auth_file2)
+    if headers:
+        return Identity("user2", headers)
+    if args.login and sys.stdin.isatty():
+        return prompt_for_identity("user2")
+    return ANONYMOUS
+
+def has_object_param(path_template):
+    """
+    True if a path has a placeholder that looks like an object identifier,
+    e.g. /users/{id}, /orders/{orderId}, /files/{uuid} — the endpoints where
+    broken object-level authorization (IDOR) lives.
+    """
+    names = re.findall(r'\{([^}]+)\}|:([A-Za-z_]\w*)|<([^>]+)>', path_template)
+    flat = [n for group in names for n in group if n]
+    return any(re.search(r'(^|_)(id|uuid|guid|key|ref|no|num|slug)$', n.lower()) or n.lower() in
+               ('id', 'uuid', 'guid', 'key') for n in flat)
+
+def fetch_as(method, url, identity, verbose=False):
+    """
+    Re-requests a URL as a given identity and summarizes the response for IDOR
+    comparison: status, body fingerprint, length and content type. None on error.
+    """
+    try:
+        resp = http_request(method, url, identity=identity, allow_redirects=False)
+    except requests.exceptions.RequestException as e:
+        if verbose:
+            log(f"IDOR re-request {method} {url} as '{identity.name}' failed: {e}", level="DEBUG")
+        return None
+    return {
+        'status_code': resp.status_code,
+        'body_hash': body_fingerprint(resp.content, urlparse(url).path),
+        'content_length': len(resp.content),
+        'content_type': short_content_type(resp),
+    }
+
+def test_idor(primary_results, identity_b, verbose=False):
+    """
+    Broken object-level authorization check. For each object endpoint that the
+    primary identity (A) read successfully, re-requests the SAME url as identity B
+    and as anonymous. If either gets a 2xx whose body matches A's, that party can
+    read A's object -> IDOR/BOLA. Only GET is replayed (re-reading is non-destructive).
+    Returns a list of finding dicts.
+    """
+    seen = set()
+    candidates = []
+    for r in primary_results:
+        if r['method'] != 'GET':
+            continue
+        if not (200 <= r['status_code'] < 300):
+            continue
+        if not has_object_param(r['path_template']):
+            continue
+        if not r.get('_body_hash'):
+            continue
+        if r['url'] in seen:
+            continue
+        seen.add(r['url'])
+        candidates.append(r)
+
+    if not candidates:
+        log("IDOR: no object-level GET endpoints were accessible as the primary identity; nothing to compare.",
+            level="INFO")
+        return []
+
+    log(f"IDOR: replaying {len(candidates)} object endpoint(s) as '{identity_b.name}' and anonymous.",
+        level="INFO")
+
+    testers = [identity_b]
+    if identity_b is not ANONYMOUS:
+        testers.append(ANONYMOUS)
+
+    findings = []
+    for r in candidates:
+        for tester in testers:
+            other = fetch_as(r['method'], r['url'], tester, verbose)
+            if not other:
+                continue
+            authed = 200 <= other['status_code'] < 300
+            same_object = authed and other['body_hash'] == r['_body_hash']
+            if not same_object:
+                continue
+            # Anonymous access to A's object is worse than cross-user access
+            severity = 'critical' if tester is ANONYMOUS else 'high'
+            findings.append({
+                'test': 'idor',
+                'method': r['method'],
+                'url': r['url'],
+                'path_template': r['path_template'],
+                'owner_identity': r['identity'],
+                'tested_as': tester.name,
+                'status_code': other['status_code'],
+                'content_length': other['content_length'],
+                'severity': severity,
+                'findings': [f"BOLA/IDOR: '{tester.name}' received the same object that "
+                             f"'{r['identity']}' accessed at {urlparse(r['url']).path}"],
+            })
+            if verbose:
+                log(f"IDOR: {tester.name} read {r['url']} (owned via {r['identity']})", level="WARNING")
+    return findings
+
+def test_privesc(primary_results, low_priv_identity, verbose=False):
+    """
+    Privilege-escalation check. For each privileged endpoint the primary identity
+    (expected to be an admin) could read, re-requests the SAME url as the
+    lower-privilege identity and anonymously. A 2xx for them means the endpoint
+    did not enforce the privilege. GET only (re-reading is non-destructive).
+    Returns a list of finding dicts.
+    """
+    seen = set()
+    candidates = []
+    for r in primary_results:
+        if r['method'] != 'GET' or not (200 <= r['status_code'] < 300):
+            continue
+        if not r.get('privileged_reason') or not r.get('_body_hash'):
+            continue
+        if r['url'] in seen:
+            continue
+        seen.add(r['url'])
+        candidates.append(r)
+
+    if not candidates:
+        log("Privilege escalation: no privileged GET endpoints were accessible as the primary "
+            "(admin) identity; nothing to compare.", level="INFO")
+        return []
+
+    log(f"Privilege escalation: replaying {len(candidates)} privileged endpoint(s) as "
+        f"'{low_priv_identity.name}' and anonymous.", level="INFO")
+
+    testers = [low_priv_identity]
+    if low_priv_identity is not ANONYMOUS:
+        testers.append(ANONYMOUS)
+
+    findings = []
+    for r in candidates:
+        for tester in testers:
+            other = fetch_as(r['method'], r['url'], tester, verbose)
+            if not other or not (200 <= other['status_code'] < 300):
+                continue
+            same = other['body_hash'] == r['_body_hash']
+            anon = tester is ANONYMOUS
+            if same:
+                severity = 'critical' if anon else 'high'
+                detail = (f"Privilege escalation: '{tester.name}' received the same privileged "
+                          f"response as '{r['identity']}'")
+            else:
+                # Not rejected, but different body: worth manual review, lower confidence
+                severity = 'high' if anon else 'medium'
+                detail = (f"Privilege escalation: privileged endpoint returned "
+                          f"HTTP {other['status_code']} to '{tester.name}' (expected 401/403)")
+            findings.append({
+                'test': 'privesc',
+                'method': r['method'],
+                'url': r['url'],
+                'path_template': r['path_template'],
+                'privileged_reason': r['privileged_reason'],
+                'owner_identity': r['identity'],
+                'tested_as': tester.name,
+                'status_code': other['status_code'],
+                'content_length': other['content_length'],
+                'severity': severity,
+                'findings': [detail],
+            })
+            if verbose:
+                log(f"Privesc: {tester.name} reached {r['url']} ({r['privileged_reason']})", level="WARNING")
+    return findings
+
+def b64url_decode_json(segment):
+    """
+    Decodes a base64url JWT segment into a dict, or None if it isn't valid JSON.
+    """
+    try:
+        padded = segment + '=' * (-len(segment) % 4)
+        return json.loads(base64.urlsafe_b64decode(padded.encode()))
+    except (ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+def decode_jwt(token):
+    """
+    Splits a JWT and decodes its header and payload without verifying the
+    signature. Returns (header, payload, parts) or None if it isn't a JWT.
+    """
+    parts = token.split('.')
+    if len(parts) != 3:
+        return None
+    header = b64url_decode_json(parts[0])
+    payload = b64url_decode_json(parts[1])
+    if not isinstance(header, dict) or not isinstance(payload, dict):
+        return None
+    return header, payload, parts
+
+def bearer_token(identity):
+    """
+    Returns the bearer token from an identity's Authorization header, or None.
+    """
+    value = identity.headers.get('Authorization', '') if identity else ''
+    if value.lower().startswith('bearer '):
+        return value[7:].strip()
+    return None
+
+def analyze_jwt(token, label):
+    """
+    Offline hygiene checks on a JWT: 'alg: none', symmetric alg, missing or long
+    expiry, and sensitive data (PII/secrets) carried in the payload. No network,
+    no signature verification. Returns a list of finding dicts.
+    """
+    decoded = decode_jwt(token)
+    if not decoded:
+        return []
+    header, payload, _ = decoded
+    alg = str(header.get('alg', '')).lower()
+    findings = []
+
+    def add(severity, detail):
+        findings.append({'test': 'jwt', 'identity': label, 'severity': severity, 'findings': [detail]})
+
+    if alg == 'none':
+        add('critical', f"{label}: JWT header uses 'alg: none' — the signature can be stripped")
+    elif alg.startswith('hs'):
+        add('low', f"{label}: JWT uses symmetric {header.get('alg')} — vulnerable if the signing secret is weak")
+
+    now = time.time()
+    exp = payload.get('exp')
+    if exp is None:
+        add('medium', f"{label}: JWT has no 'exp' claim — the token does not expire")
+    elif isinstance(exp, (int, float)):
+        if exp < now:
+            add('info', f"{label}: JWT is expired")
+        else:
+            iat = payload.get('iat')
+            lifetime = (exp - iat) if isinstance(iat, (int, float)) else (exp - now)
+            if lifetime > 30 * 24 * 3600:
+                add('low', f"{label}: JWT lifetime is very long (~{int(lifetime // 86400)} days)")
+
+    payload_text = json.dumps(payload)
+    if detect_pii(payload_text):
+        add('medium', f"{label}: JWT payload contains PII")
+    secrets, _ = detect_sensitive_info(payload_text)
+    if secrets:
+        add('high', f"{label}: JWT payload contains a secret ({', '.join(secrets)})")
+    return findings
+
+def tampered_tokens(parts):
+    """
+    Yields (name, token) pairs of non-destructive tampered variants used to check
+    whether the server actually verifies the signature: an 'alg: none' token with
+    the same claims, the original claims with the signature removed, and the token
+    with its signature corrupted.
+    """
+    header, payload = parts[0], parts[1]
+    none_header = base64.urlsafe_b64encode(b'{"alg":"none","typ":"JWT"}').decode().rstrip('=')
+    yield ("alg:none", f"{none_header}.{payload}.")
+    yield ("stripped signature", f"{header}.{payload}.")
+    corrupt = parts[2][:-1] + ('A' if parts[2][-1:] != 'A' else 'B') if parts[2] else 'AAAA'
+    yield ("corrupted signature", f"{header}.{payload}.{corrupt}")
+
+def test_jwt(identity, identity_b, all_results, verbose=False):
+    """
+    JWT token checks. Runs offline hygiene analysis on each identity's bearer token,
+    then, if a protected GET endpoint was read successfully, re-requests it with
+    tampered tokens (GET only). A 2xx whose body matches the original means the
+    signature is not being verified. Returns a list of finding dicts.
+    """
+    findings = []
+    for ident in [identity, identity_b]:
+        token = bearer_token(ident)
+        if token:
+            findings.extend(analyze_jwt(token, ident.name))
+
+    token = bearer_token(identity)
+    parts = token.split('.') if token else []
+    if len(parts) == 3:
+        target = next((r for r in all_results
+                       if r['method'] == 'GET' and 200 <= r['status_code'] < 300 and r.get('_body_hash')), None)
+        if target:
+            log(f"JWT: testing token verification against {target['url']}.", level="INFO")
+            for name, bad_token in tampered_tokens(parts):
+                probe = Identity("jwt-probe", {'Authorization': f"Bearer {bad_token}"})
+                other = fetch_as('GET', target['url'], probe, verbose)
+                if other and 200 <= other['status_code'] < 300 and other['body_hash'] == target['_body_hash']:
+                    findings.append({
+                        'test': 'jwt', 'identity': identity.name, 'severity': 'critical',
+                        'url': target['url'],
+                        'findings': [f"Signature not verified: a token with a {name} was accepted "
+                                     f"(same response) at {urlparse(target['url']).path}"],
+                    })
+    return findings
+
+def fetch_text(url, verbose=False):
+    """
+    GETs a URL and returns (status_code, body_text, content_type), or None on error.
+    """
+    try:
+        resp = http_request('GET', url, allow_redirects=False)
+    except requests.exceptions.RequestException as e:
+        if verbose:
+            log(f"Injection probe {url} failed: {e}", level="DEBUG")
+        return None
+    return resp.status_code, resp.content.decode('utf-8', errors='ignore'), short_content_type(resp)
+
+def test_injection(verbose=False):
+    """
+    Sends benign marker probes to each GET parameter and looks for two indicators:
+    a database error triggered by an injected quote (possible SQL injection), and an
+    unencoded reflection of a unique marker in an HTML/JS response (possible XSS).
+    Non-destructive: it only reads, and never sends exploit payloads. Returns findings.
+    """
+    if not probe_targets:
+        log("Injection: no GET endpoints with parameters to probe.", level="INFO")
+        return []
+    log(f"Injection: probing parameters on {len(probe_targets)} GET endpoint(s).", level="INFO")
+
+    findings = []
+    seen = set()
+    for tgt in probe_targets:
+        params = tgt['parameters']
+        base_mapping = tgt['value_mapping']
+        for pname in list(base_mapping):
+            key = (tgt['full_path'], pname)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            baseline_val = base_mapping[pname]
+            baseline_url = build_full_url(tgt['base_url_no_path'], tgt['full_path'], params, base_mapping)
+            baseline = fetch_text(baseline_url, verbose)
+            baseline_text = baseline[1] if baseline else ""
+
+            # Error-based indicator: append a single quote and look for new DB errors
+            err_map = dict(base_mapping)
+            err_map[pname] = f"{baseline_val}'"
+            err = fetch_text(build_full_url(tgt['base_url_no_path'], tgt['full_path'], params, err_map), verbose)
+            if err:
+                new_errors = set(find_sql_errors(err[1])) - set(find_sql_errors(baseline_text))
+                if new_errors:
+                    findings.append({
+                        'test': 'injection', 'type': 'SQL error', 'severity': 'high',
+                        'url': baseline_url, 'parameter': pname, 'status_code': err[0],
+                        'findings': [f"Possible SQL injection: parameter '{pname}' triggered a "
+                                     f"database error when a quote was added"],
+                    })
+                    continue
+
+            # Reflection indicator: a unique marker with HTML specials, returned unencoded
+            marker = f"axzq{uuid.uuid4().hex[:8]}"
+            payload = f"{marker}\"'<x>"
+            refl_map = dict(base_mapping)
+            refl_map[pname] = payload
+            refl = fetch_text(build_full_url(tgt['base_url_no_path'], tgt['full_path'], params, refl_map), verbose)
+            if refl and f"{marker}\"'<x>" in refl[1] and ('html' in refl[2] or 'javascript' in refl[2]):
+                findings.append({
+                    'test': 'injection', 'type': 'reflected input', 'severity': 'medium',
+                    'url': baseline_url, 'parameter': pname, 'status_code': refl[0],
+                    'findings': [f"Reflected input: parameter '{pname}' is echoed unencoded into "
+                                 f"an {refl[2]} response (possible XSS)"],
+                })
+    return findings
+
+def test_rate_limit(url, burst=25, verbose=False):
+    """
+    Bounded rate-limit probe (not a flood): sends a small, fixed burst of GETs to one
+    URL, bypassing the configured rate limit, and reports whether the server throttled
+    (429/503). Returns a single finding dict, or None if the request could not run.
+    """
+    log(f"Rate-limit check: sending {burst} requests to {url}.", level="INFO")
+    saved_interval = rate_limiter.interval
+    rate_limiter.set_rate(0)  # the burst must not be self-throttled, or the test is meaningless
+    statuses = []
+    try:
+        with ThreadPoolExecutor(max_workers=min(burst, 20)) as ex:
+            def one(_):
+                try:
+                    return http_request('GET', url, allow_redirects=False).status_code
+                except requests.exceptions.RequestException:
+                    return None
+            statuses = [s for s in ex.map(one, range(burst)) if s is not None]
+    finally:
+        rate_limiter.interval = saved_interval
+
+    if not statuses:
+        log("Rate-limit check: no responses received.", level="WARNING")
+        return None
+    throttled = sum(1 for s in statuses if s in (429, 503))
+    limited = throttled > 0
+    return {
+        'test': 'rate_limit', 'url': url, 'requests_sent': len(statuses),
+        'throttled_responses': throttled,
+        'severity': 'info' if limited else 'low',
+        'findings': [f"{throttled}/{len(statuses)} requests were throttled (429/503)" if limited
+                     else f"No throttling after {len(statuses)} rapid requests — rate limiting "
+                          f"may be absent"],
+    }
+
+def print_simple_findings(title, findings, extra_col=None):
+    """
+    Prints a findings list (injection or rate-limit) as a table. extra_col is an
+    optional (header, key) pair for one more column.
+    """
+    table = Table(title=title, show_lines=True)
+    table.add_column("Severity", no_wrap=True)
+    table.add_column("URL", style="magenta", overflow="fold")
+    if extra_col:
+        table.add_column(extra_col[0], style="cyan", no_wrap=True)
+    table.add_column("Detail", overflow="fold")
+    for f in findings:
+        sev_style = SEVERITY_STYLES[f['severity']]
+        row = [f"[{sev_style}]{f['severity'].upper()}[/{sev_style}]", f['url']]
+        if extra_col:
+            row.append(escape(str(f.get(extra_col[1], ""))))
+        row.append(escape("; ".join(f['findings'])))
+        table.add_row(*row)
+    output_console.print(table)
+
+def print_privesc_findings(privesc_findings):
+    """
+    Prints the privilege-escalation findings as their own table.
+    """
+    table = Table(title="Privilege Escalation Findings", show_lines=True)
+    table.add_column("Severity", no_wrap=True)
+    table.add_column("Method", style="cyan", no_wrap=True)
+    table.add_column("URL", style="magenta", overflow="fold")
+    table.add_column("Reached by", style="red", no_wrap=True)
+    table.add_column("Status", style="green", no_wrap=True)
+    table.add_column("Privileged because", overflow="fold")
+    for f in privesc_findings:
+        sev_style = SEVERITY_STYLES[f['severity']]
+        table.add_row(
+            f"[{sev_style}]{f['severity'].upper()}[/{sev_style}]",
+            f['method'], f['url'], f['tested_as'], str(f['status_code']),
+            escape(f['privileged_reason'] or ""),
+        )
+    output_console.print(table)
+
+def print_idor_findings(idor_findings):
+    """
+    Prints the IDOR/BOLA findings as their own table.
+    """
+    table = Table(title="IDOR / BOLA Findings", show_lines=True)
+    table.add_column("Severity", no_wrap=True)
+    table.add_column("Method", style="cyan", no_wrap=True)
+    table.add_column("URL", style="magenta", overflow="fold")
+    table.add_column("Accessed by", style="red", no_wrap=True)
+    table.add_column("Status", style="green", no_wrap=True)
+    for f in idor_findings:
+        sev_style = SEVERITY_STYLES[f['severity']]
+        table.add_row(
+            f"[{sev_style}]{f['severity'].upper()}[/{sev_style}]",
+            f['method'], f['url'], f['tested_as'], str(f['status_code']),
+        )
+    output_console.print(table)
+
+def main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rate, brute, json_output,
+         output_file=None, identity=None, identity_b=None, idor=False, privesc=False,
+         injection=False, rate_limit_check=False, rate_limit_burst=25, jwt=False):
     """
     Main function controlling flow:
     1. Tracks start time
@@ -1841,15 +2552,24 @@ def main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rat
     4. Accumulates results
     5. Prints or outputs final results and stats
     """
-    global SCAN_START_TIME, SCAN_END_TIME, TOTAL_REQUESTS
+    global SCAN_START_TIME, SCAN_END_TIME, TOTAL_REQUESTS, AUTH_REQUIRED_COUNT
     SCAN_START_TIME = time.time()  # Start the timer
     rate_limiter.set_rate(rate)
+    AUTH_REQUIRED_COUNT = 0
+    if identity is not None:
+        set_active_identity(identity)
+    scan_identity = active_identity
+
+    global ACTIVE_PROBES_ENABLED, probe_targets
+    ACTIVE_PROBES_ENABLED = injection
+    probe_targets = []
 
     all_results = []
     processed_urls = process_input(urls)
     results_lock = threading.Lock()
 
     stats = {
+        "scan_identity": active_identity.name,
         "unique_hosts_provided": len(set(urlparse(u).netloc for u in processed_urls)),
         "active_hosts": 0,
         "hosts_with_valid_spec": 0,
@@ -1983,6 +2703,8 @@ def main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rat
 
     if not product_mode:
         print_banner()
+    if scan_identity.authenticated:
+        log(f"Scanning as authenticated identity '{scan_identity.name}'.", level="INFO")
 
     max_workers2 = min(100, os.cpu_count() * 5, len(processed_urls)) if len(processed_urls) > 0 else 1
     with ThreadPoolExecutor(max_workers=max_workers2) as executor:
@@ -2012,6 +2734,53 @@ def main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rat
                 except Exception as exc:
                     if verbose:
                         log(f"Error processing URL {u}: {exc}", level="DEBUG")
+
+    # IDOR / BOLA: replay the primary identity's object reads as the second identity
+    idor_findings = []
+    if idor:
+        if identity_b is None or not identity_b.authenticated:
+            log("IDOR test skipped: a second identity is required "
+                "(--token2/--auth-file2/--header2, or interactive --login with --idor).", level="WARNING")
+        elif not scan_identity.authenticated:
+            log("IDOR test skipped: scan as a primary identity too (-H/--token/--login).", level="WARNING")
+        else:
+            idor_findings = test_idor(all_results, identity_b, verbose)
+
+    # Privilege escalation: replay the admin identity's privileged reads as the lower-privilege one
+    privesc_findings = []
+    if privesc:
+        if not scan_identity.authenticated:
+            log("Privilege escalation test skipped: scan as the admin identity "
+                "(-H/--token/--login).", level="WARNING")
+        else:
+            # Second identity is the lower-privilege user; fall back to anonymous if absent
+            low_priv = identity_b if (identity_b and identity_b.authenticated) else ANONYMOUS
+            if low_priv is ANONYMOUS:
+                log("Privilege escalation: no second identity given; testing anonymous access only.",
+                    level="INFO")
+            privesc_findings = test_privesc(all_results, low_priv, verbose)
+
+    # JWT token hygiene (offline) + signature-verification check (GET only)
+    jwt_findings = test_jwt(scan_identity, identity_b, all_results, verbose) if jwt else []
+
+    # Internal field kept only for the IDOR/privesc/JWT comparison; strip before output
+    for res in all_results:
+        res.pop('_body_hash', None)
+
+    # Injection indicators (benign marker probes on GET parameters)
+    injection_findings = test_injection(verbose) if injection else []
+
+    # Bounded rate-limit probe against one representative GET endpoint
+    rate_limit_findings = []
+    if rate_limit_check:
+        target_url = next((r['url'] for r in all_results
+                           if r['method'] == 'GET' and 200 <= r['status_code'] < 300), None)
+        if target_url:
+            rl = test_rate_limit(target_url, burst=rate_limit_burst, verbose=verbose)
+            if rl:
+                rate_limit_findings.append(rl)
+        else:
+            log("Rate-limit check skipped: no successful GET endpoint to probe.", level="WARNING")
 
     SCAN_END_TIME = time.time()  # End the timer
     scan_duration = SCAN_END_TIME - SCAN_START_TIME
@@ -2055,6 +2824,16 @@ def main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rat
             clean_final_results.append(clean_res)
 
         output = {"results": clean_final_results}
+        if idor_findings:
+            output["idor_findings"] = idor_findings
+        if privesc_findings:
+            output["privesc_findings"] = privesc_findings
+        if injection_findings:
+            output["injection_findings"] = injection_findings
+        if rate_limit_findings:
+            output["rate_limit_findings"] = rate_limit_findings
+        if jwt_findings:
+            output["jwt_findings"] = jwt_findings
         if stats_flag:
             output["stats"] = stats
         output_console.print_json(data=output)
@@ -2084,6 +2863,16 @@ def main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rat
         report_results = final_results
         if json_output:
             out = {"results": final_results}
+            if idor_findings:
+                out["idor_findings"] = idor_findings
+            if privesc_findings:
+                out["privesc_findings"] = privesc_findings
+            if injection_findings:
+                out["injection_findings"] = injection_findings
+            if rate_limit_findings:
+                out["rate_limit_findings"] = rate_limit_findings
+            if jwt_findings:
+                out["jwt_findings"] = jwt_findings
             if stats_flag:
                 out["stats"] = stats
             output_console.print_json(data=out)
@@ -2126,6 +2915,21 @@ def main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rat
         else:
             log("No valid API responses found.", level="INFO")
 
+        if idor_findings and not json_output:
+            print_idor_findings(idor_findings)
+
+        if privesc_findings and not json_output:
+            print_privesc_findings(privesc_findings)
+
+        if injection_findings and not json_output:
+            print_simple_findings("Injection Findings", injection_findings, ("Parameter", "parameter"))
+
+        if rate_limit_findings and not json_output:
+            print_simple_findings("Rate-limit Check", rate_limit_findings)
+
+        if jwt_findings and not json_output:
+            print_simple_findings("JWT / Token Findings", jwt_findings, ("Identity", "identity"))
+
         if stats_flag and not json_output:
             stats_table = Table(title="Scan Statistics", show_lines=False)
             stats_table.add_column("Metric", style="cyan")
@@ -2145,10 +2949,24 @@ def main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rat
 
             output_console.print(stats_table)
 
+    stats["auth_required_endpoints"] = AUTH_REQUIRED_COUNT
+    stats["idor_findings"] = len(idor_findings)
+    stats["privesc_findings"] = len(privesc_findings)
+    stats["injection_findings"] = len(injection_findings)
+    stats["jwt_findings"] = len(jwt_findings)
+    # Nudge toward authenticated testing when anonymous and endpoints needed auth
+    if not scan_identity.authenticated and AUTH_REQUIRED_COUNT > 0 and not product_mode:
+        log(f"{AUTH_REQUIRED_COUNT} endpoint(s) returned 401/403 (authentication required). "
+            "Rerun with --login (or -H/--token) to test them as a logged-in user.",
+            level="INFO")
+
     # Save the full report (results + stats) as JSON if requested
     if output_file:
         with open(output_file, 'w') as f:
-            json.dump({"results": report_results, "stats": stats}, f, indent=2, default=str)
+            json.dump({"results": report_results, "idor_findings": idor_findings,
+                       "privesc_findings": privesc_findings, "injection_findings": injection_findings,
+                       "rate_limit_findings": rate_limit_findings, "jwt_findings": jwt_findings,
+                       "stats": stats}, f, indent=2, default=str)
         log(f"Results written to {output_file}", level="INFO")
 
     # Writes any bad hosts to a file for reference
@@ -2177,7 +2995,50 @@ if __name__ == "__main__":
     parser.add_argument("-json", action="store_true", help="Output results in JSON format in default mode.")
     parser.add_argument("-o", "--output", metavar="FILE", help="Also write results and stats as JSON to FILE.")
 
+    auth = parser.add_argument_group("authenticated testing")
+    auth.add_argument("-H", "--header", action="append", metavar="'Name: value'",
+                      help="Header sent with every request (repeatable), e.g. -H 'Authorization: Bearer ...'.")
+    auth.add_argument("--cookie", metavar="STRING", help="Cookie header sent with every request.")
+    auth.add_argument("--token", metavar="TOKEN", help="Shortcut for -H 'Authorization: Bearer TOKEN'.")
+    auth.add_argument("--auth-file", metavar="FILE",
+                      help="JSON file with {\"headers\": {...}, \"cookie\": \"...\", \"token\": \"...\"}.")
+    auth.add_argument("--login", action="store_true",
+                      help="Prompt interactively for credentials before scanning.")
+    auth.add_argument("--login-url", metavar="URL",
+                      help="Log in by POSTing --login-data (JSON) here and reading a token from the response.")
+    auth.add_argument("--login-data", metavar="JSON",
+                      help="JSON credentials for --login-url, e.g. '{\"username\":\"a\",\"password\":\"b\"}'.")
+    auth.add_argument("--token-path", metavar="PATH", default="token",
+                      help="Dotted path to the token in the login response (default: token).")
+
+    idor = parser.add_argument_group("authorization testing (IDOR / BOLA)")
+    idor.add_argument("--idor", action="store_true",
+                      help="After scanning as the primary identity, replay object reads as a second "
+                           "identity and anonymously, flagging cross-user access. Needs two identities.")
+    idor.add_argument("--header2", action="append", metavar="'Name: value'",
+                      help="Header for the second identity (repeatable).")
+    idor.add_argument("--cookie2", metavar="STRING", help="Cookie for the second identity.")
+    idor.add_argument("--token2", metavar="TOKEN", help="Bearer token for the second identity.")
+    idor.add_argument("--auth-file2", metavar="FILE", help="Auth JSON file for the second identity.")
+    idor.add_argument("--privesc", action="store_true",
+                      help="Scan as the primary (admin) identity, then check whether the second "
+                           "identity or anonymous requests can reach privileged (admin) endpoints.")
+
+    active = parser.add_argument_group("active testing (use only with authorization)")
+    active.add_argument("--injection", action="store_true",
+                        help="Probe GET parameters for SQL-error and reflected-input (XSS) indicators "
+                             "using benign markers. Reads only; no exploit payloads.")
+    active.add_argument("--rate-limit-check", action="store_true",
+                        help="Send a small, bounded burst to one endpoint and report whether the "
+                             "server throttles (429/503).")
+    active.add_argument("--rate-limit-burst", type=int, default=25, metavar="N",
+                        help="Number of requests in the rate-limit burst (default: 25, max: 200).")
+    active.add_argument("--jwt", action="store_true",
+                        help="Analyze the supplied bearer token(s) for weak JWT settings and check "
+                             "whether the server verifies the signature (accepts a tampered token).")
+
     args = parser.parse_args()
+    args.rate_limit_burst = max(1, min(args.rate_limit_burst, 200))
 
     if not args.urls and not sys.stdin.isatty():
         urls = [line.strip() for line in sys.stdin if line.strip()]
@@ -2210,4 +3071,10 @@ if __name__ == "__main__":
         logger.addHandler(file_handler)
         logger.propagate = False
 
-    main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rate, brute, json_output, args.output)
+    scan_identity = build_identity(args)
+    second_identity = build_second_identity(args) if (args.idor or args.privesc) else None
+
+    main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rate, brute, json_output,
+         args.output, identity=scan_identity, identity_b=second_identity, idor=args.idor, privesc=args.privesc,
+         injection=args.injection, rate_limit_check=args.rate_limit_check,
+         rate_limit_burst=args.rate_limit_burst, jwt=args.jwt)

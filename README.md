@@ -28,6 +28,10 @@
 
 Autoswagger automates the process of finding **OpenAPI/Swagger** specifications, extracting API endpoints, and systematically testing them for **PII** exposure, **secrets**, and large or interesting responses. It leverages **Presidio** for PII recognition and **regex** for sensitive key/token detection.
 
+By default it scans **unauthenticated**. When endpoints return 401/403, it reports how many require auth and suggests rerunning with credentials. Supplying credentials (`-H`, `--token`, `--auth-file`, or interactive `--login`) scans the API **as a logged-in user**, which is the foundation for the authorization testing on the roadmap (IDOR, privilege escalation).
+
+> **Authorized use only.** Run Autoswagger only against systems you have explicit written permission to test, especially in authenticated mode.
+
 ---
 
 ## Key Features
@@ -92,6 +96,21 @@ Autoswagger automates the process of finding **OpenAPI/Swagger** specifications,
 | `-b, --brute`        | Enables brute-forcing of parameter values (multiple test combos).                                            |
 | `-json`              | Outputs results in JSON format instead of a Rich table in default mode.                                      |
 | `-o, --output FILE`  | Also writes results and stats as JSON to FILE.                                                               |
+| `-H, --header`       | Header sent with every request (repeatable), e.g. `-H 'Authorization: Bearer ...'`. Enables authenticated scanning. |
+| `--cookie STRING`    | Cookie header sent with every request.                                                                      |
+| `--token TOKEN`      | Shortcut for `-H 'Authorization: Bearer TOKEN'`.                                                             |
+| `--auth-file FILE`   | JSON file: `{"headers": {...}, "cookie": "...", "token": "..."}`.                                            |
+| `--login`            | Prompt interactively for credentials before scanning.                                                       |
+| `--login-url URL`    | Log in by POSTing `--login-data` (JSON) here and reading a token from the response.                          |
+| `--login-data JSON`  | JSON credentials for `--login-url`.                                                                          |
+| `--token-path PATH`  | Dotted path to the token in the login response (default: `token`).                                           |
+| `--idor`             | After scanning as the primary identity, replay object reads as a second identity and anonymously; flag cross-user access (BOLA/IDOR). |
+| `--header2 / --cookie2 / --token2 / --auth-file2` | Credentials for the second identity used by `--idor`.                            |
+| `--privesc`          | Scan as the primary (admin) identity, then check whether the second identity or anonymous requests can reach privileged (admin) endpoints. |
+| `--injection`        | Probe GET parameters for SQL-error and reflected-input (XSS) indicators using benign markers. |
+| `--rate-limit-check` | Send a small bounded burst to one endpoint and report whether it throttles (429/503). |
+| `--rate-limit-burst N` | Requests in the rate-limit burst (default 25, max 200). |
+| `--jwt`              | Analyze supplied bearer token(s) for weak JWT settings and test whether the server verifies the signature. |
 
 
 ## Help
@@ -213,6 +232,38 @@ Before testing, Autoswagger requests a random nonexistent path to learn what the
 Start with CRITICAL and HIGH rows: these are responses that contained secrets or PII without authentication. "Auth not enforced" findings are endpoints the spec itself says need credentials, but which answered an unauthenticated request with a 2xx. These are strong candidates for broken access control. All findings should be manually checked to confirm. You may also wish to look at INFO rows and determine whether it's intended for these endpoints to be public or not.
 
 Simple GET endpoints can be triaged using command line tools like curl, but we would recommend using your usual API testing suite (tools such as Postman or Burp Suite) to replay requests and read responses to confirm whether an exposure is present.
+
+---
+
+## Authorization testing (IDOR / BOLA)
+
+With `--idor` and two identities, Autoswagger looks for **broken object-level authorization** — one user reading another user's objects:
+
+1. It scans as the **primary** identity (`-H`/`--token`/`--login`) and records the object endpoints (e.g. `/users/{id}`) it could read.
+2. It re-requests each of those exact URLs as the **second** identity (`--token2`/`--auth-file2`/`--header2`) and anonymously.
+3. If the second identity or an anonymous request gets back the **same object**, that is reported as a finding: `HIGH` for cross-user access, `CRITICAL` for anonymous access.
+
+```bash
+python3 autoswagger.py https://api.example.com --token "$TOKEN_A" --idor --token2 "$TOKEN_B"
+```
+
+Only `GET` is replayed (re-reading is non-destructive). This needs real credentials for two accounts; run it only against systems you are authorized to test.
+
+### Privilege escalation (`--privesc`)
+
+Run as the **admin** identity with a lower-privilege second identity. Autoswagger finds endpoints that look privileged — an admin-like path segment (`/admin/...`, `/manage/...`, `/internal/...`) or a security scope such as `admin:read` — that the admin could read, then re-requests each as the lower-privilege identity and anonymously. A `2xx` means the privilege was not enforced: `HIGH`/`CRITICAL` when the same privileged data comes back, `MEDIUM` when the endpoint simply failed to reject the request.
+
+```bash
+python3 autoswagger.py https://api.example.com --token "$ADMIN_TOKEN" --privesc --token2 "$USER_TOKEN"
+```
+
+### Active testing (`--injection`, `--rate-limit-check`)
+
+These send crafted requests, so use them only against systems you are authorized to test.
+
+- **`--injection`** probes each GET parameter with two benign markers: a single quote (and looks for a *new* database error in the response — a SQL-injection indicator) and a unique string with HTML special characters (and looks for it reflected unencoded in an HTML/JS response — an XSS indicator). It reads only and sends no exploit payloads; findings are indicators to confirm manually.
+- **`--rate-limit-check`** sends a small bounded burst (`--rate-limit-burst`, default 25) to one endpoint and reports whether the server throttled. It is a configuration check, not a load test.
+- **`--jwt`** inspects any bearer token you supply (offline, no requests): it flags `alg: none`, symmetric algorithms, a missing or very long expiry, and PII/secrets carried in the payload. It then re-requests one protected endpoint with tampered tokens (an `alg:none` variant, a stripped signature, a corrupted signature); if the server accepts any of them, the signature is not being verified (`CRITICAL`).
 
 ---
 
