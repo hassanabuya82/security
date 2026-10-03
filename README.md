@@ -104,6 +104,8 @@ By default it scans **unauthenticated**. When endpoints return 401/403, it repor
 | `--login-url URL`    | Log in by POSTing `--login-data` (JSON) here and reading a token from the response.                          |
 | `--login-data JSON`  | JSON credentials for `--login-url`.                                                                          |
 | `--token-path PATH`  | Dotted path to the token in the login response (default: `token`).                                           |
+| `--idor`             | After scanning as the primary identity, replay object reads as a second identity and anonymously; flag cross-user access (BOLA/IDOR). |
+| `--header2 / --cookie2 / --token2 / --auth-file2` | Credentials for the second identity used by `--idor`.                            |
 
 
 ## Help
@@ -225,6 +227,22 @@ Before testing, Autoswagger requests a random nonexistent path to learn what the
 Start with CRITICAL and HIGH rows: these are responses that contained secrets or PII without authentication. "Auth not enforced" findings are endpoints the spec itself says need credentials, but which answered an unauthenticated request with a 2xx. These are strong candidates for broken access control. All findings should be manually checked to confirm. You may also wish to look at INFO rows and determine whether it's intended for these endpoints to be public or not.
 
 Simple GET endpoints can be triaged using command line tools like curl, but we would recommend using your usual API testing suite (tools such as Postman or Burp Suite) to replay requests and read responses to confirm whether an exposure is present.
+
+---
+
+## Authorization testing (IDOR / BOLA)
+
+With `--idor` and two identities, Autoswagger looks for **broken object-level authorization** — one user reading another user's objects:
+
+1. It scans as the **primary** identity (`-H`/`--token`/`--login`) and records the object endpoints (e.g. `/users/{id}`) it could read.
+2. It re-requests each of those exact URLs as the **second** identity (`--token2`/`--auth-file2`/`--header2`) and anonymously.
+3. If the second identity or an anonymous request gets back the **same object**, that is reported as a finding: `HIGH` for cross-user access, `CRITICAL` for anonymous access.
+
+```bash
+python3 autoswagger.py https://api.example.com --token "$TOKEN_A" --idor --token2 "$TOKEN_B"
+```
+
+Only `GET` is replayed (re-reading is non-destructive). This needs real credentials for two accounts; run it only against systems you are authorized to test.
 
 ---
 

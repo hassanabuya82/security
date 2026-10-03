@@ -1451,8 +1451,7 @@ def test_endpoints(base_url, base_path, swagger_spec, verbose=False,
 
     if filtered_count and not product_mode:
         log(f"Discarded {filtered_count} catch-all/soft-404 response(s) for {base_url}.", level="INFO")
-    for res in all_results:
-        res.pop('_body_hash', None)
+    # _body_hash is kept here (used by the IDOR test) and stripped in main before output
     return all_results
 
 def resolve_refs(spec):
@@ -2015,8 +2014,133 @@ def build_identity(args):
 
     return Identity("user", headers) if headers else ANONYMOUS
 
+def build_second_identity(args):
+    """
+    Assembles the second identity for the IDOR test from the *2 flags, or an
+    interactive prompt (when --login is set and a terminal is available).
+    Returns an Identity, or the anonymous one if nothing was provided.
+    """
+    headers = headers_from_sources(args.header2, args.cookie2, args.token2, args.auth_file2)
+    if headers:
+        return Identity("user2", headers)
+    if args.login and sys.stdin.isatty():
+        return prompt_for_identity("user2")
+    return ANONYMOUS
+
+def has_object_param(path_template):
+    """
+    True if a path has a placeholder that looks like an object identifier,
+    e.g. /users/{id}, /orders/{orderId}, /files/{uuid} — the endpoints where
+    broken object-level authorization (IDOR) lives.
+    """
+    names = re.findall(r'\{([^}]+)\}|:([A-Za-z_]\w*)|<([^>]+)>', path_template)
+    flat = [n for group in names for n in group if n]
+    return any(re.search(r'(^|_)(id|uuid|guid|key|ref|no|num|slug)$', n.lower()) or n.lower() in
+               ('id', 'uuid', 'guid', 'key') for n in flat)
+
+def fetch_as(method, url, identity, verbose=False):
+    """
+    Re-requests a URL as a given identity and summarizes the response for IDOR
+    comparison: status, body fingerprint, length and content type. None on error.
+    """
+    try:
+        resp = http_request(method, url, identity=identity, allow_redirects=False)
+    except requests.exceptions.RequestException as e:
+        if verbose:
+            log(f"IDOR re-request {method} {url} as '{identity.name}' failed: {e}", level="DEBUG")
+        return None
+    return {
+        'status_code': resp.status_code,
+        'body_hash': body_fingerprint(resp.content, urlparse(url).path),
+        'content_length': len(resp.content),
+        'content_type': short_content_type(resp),
+    }
+
+def test_idor(primary_results, identity_b, verbose=False):
+    """
+    Broken object-level authorization check. For each object endpoint that the
+    primary identity (A) read successfully, re-requests the SAME url as identity B
+    and as anonymous. If either gets a 2xx whose body matches A's, that party can
+    read A's object -> IDOR/BOLA. Only GET is replayed (re-reading is non-destructive).
+    Returns a list of finding dicts.
+    """
+    seen = set()
+    candidates = []
+    for r in primary_results:
+        if r['method'] != 'GET':
+            continue
+        if not (200 <= r['status_code'] < 300):
+            continue
+        if not has_object_param(r['path_template']):
+            continue
+        if not r.get('_body_hash'):
+            continue
+        if r['url'] in seen:
+            continue
+        seen.add(r['url'])
+        candidates.append(r)
+
+    if not candidates:
+        log("IDOR: no object-level GET endpoints were accessible as the primary identity; nothing to compare.",
+            level="INFO")
+        return []
+
+    log(f"IDOR: replaying {len(candidates)} object endpoint(s) as '{identity_b.name}' and anonymous.",
+        level="INFO")
+
+    testers = [identity_b]
+    if identity_b is not ANONYMOUS:
+        testers.append(ANONYMOUS)
+
+    findings = []
+    for r in candidates:
+        for tester in testers:
+            other = fetch_as(r['method'], r['url'], tester, verbose)
+            if not other:
+                continue
+            authed = 200 <= other['status_code'] < 300
+            same_object = authed and other['body_hash'] == r['_body_hash']
+            if not same_object:
+                continue
+            # Anonymous access to A's object is worse than cross-user access
+            severity = 'critical' if tester is ANONYMOUS else 'high'
+            findings.append({
+                'test': 'idor',
+                'method': r['method'],
+                'url': r['url'],
+                'path_template': r['path_template'],
+                'owner_identity': r['identity'],
+                'tested_as': tester.name,
+                'status_code': other['status_code'],
+                'content_length': other['content_length'],
+                'severity': severity,
+                'findings': [f"BOLA/IDOR: '{tester.name}' received the same object that "
+                             f"'{r['identity']}' accessed at {urlparse(r['url']).path}"],
+            })
+            if verbose:
+                log(f"IDOR: {tester.name} read {r['url']} (owned via {r['identity']})", level="WARNING")
+    return findings
+
+def print_idor_findings(idor_findings):
+    """
+    Prints the IDOR/BOLA findings as their own table.
+    """
+    table = Table(title="IDOR / BOLA Findings", show_lines=True)
+    table.add_column("Severity", no_wrap=True)
+    table.add_column("Method", style="cyan", no_wrap=True)
+    table.add_column("URL", style="magenta", overflow="fold")
+    table.add_column("Accessed by", style="red", no_wrap=True)
+    table.add_column("Status", style="green", no_wrap=True)
+    for f in idor_findings:
+        sev_style = SEVERITY_STYLES[f['severity']]
+        table.add_row(
+            f"[{sev_style}]{f['severity'].upper()}[/{sev_style}]",
+            f['method'], f['url'], f['tested_as'], str(f['status_code']),
+        )
+    output_console.print(table)
+
 def main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rate, brute, json_output,
-         output_file=None, identity=None):
+         output_file=None, identity=None, identity_b=None, idor=False):
     """
     Main function controlling flow:
     1. Tracks start time
@@ -2204,6 +2328,21 @@ def main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rat
                     if verbose:
                         log(f"Error processing URL {u}: {exc}", level="DEBUG")
 
+    # IDOR / BOLA: replay the primary identity's object reads as the second identity
+    idor_findings = []
+    if idor:
+        if identity_b is None or not identity_b.authenticated:
+            log("IDOR test skipped: a second identity is required "
+                "(--token2/--auth-file2/--header2, or interactive --login with --idor).", level="WARNING")
+        elif not scan_identity.authenticated:
+            log("IDOR test skipped: scan as a primary identity too (-H/--token/--login).", level="WARNING")
+        else:
+            idor_findings = test_idor(all_results, identity_b, verbose)
+
+    # Internal field kept only for the IDOR comparison; strip before output
+    for res in all_results:
+        res.pop('_body_hash', None)
+
     SCAN_END_TIME = time.time()  # End the timer
     scan_duration = SCAN_END_TIME - SCAN_START_TIME
 
@@ -2246,6 +2385,8 @@ def main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rat
             clean_final_results.append(clean_res)
 
         output = {"results": clean_final_results}
+        if idor_findings:
+            output["idor_findings"] = idor_findings
         if stats_flag:
             output["stats"] = stats
         output_console.print_json(data=output)
@@ -2275,6 +2416,8 @@ def main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rat
         report_results = final_results
         if json_output:
             out = {"results": final_results}
+            if idor_findings:
+                out["idor_findings"] = idor_findings
             if stats_flag:
                 out["stats"] = stats
             output_console.print_json(data=out)
@@ -2317,6 +2460,9 @@ def main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rat
         else:
             log("No valid API responses found.", level="INFO")
 
+        if idor_findings and not json_output:
+            print_idor_findings(idor_findings)
+
         if stats_flag and not json_output:
             stats_table = Table(title="Scan Statistics", show_lines=False)
             stats_table.add_column("Metric", style="cyan")
@@ -2337,6 +2483,7 @@ def main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rat
             output_console.print(stats_table)
 
     stats["auth_required_endpoints"] = AUTH_REQUIRED_COUNT
+    stats["idor_findings"] = len(idor_findings)
     # Nudge toward authenticated testing when anonymous and endpoints needed auth
     if not scan_identity.authenticated and AUTH_REQUIRED_COUNT > 0 and not product_mode:
         log(f"{AUTH_REQUIRED_COUNT} endpoint(s) returned 401/403 (authentication required). "
@@ -2346,7 +2493,8 @@ def main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rat
     # Save the full report (results + stats) as JSON if requested
     if output_file:
         with open(output_file, 'w') as f:
-            json.dump({"results": report_results, "stats": stats}, f, indent=2, default=str)
+            json.dump({"results": report_results, "idor_findings": idor_findings, "stats": stats},
+                      f, indent=2, default=str)
         log(f"Results written to {output_file}", level="INFO")
 
     # Writes any bad hosts to a file for reference
@@ -2391,6 +2539,16 @@ if __name__ == "__main__":
     auth.add_argument("--token-path", metavar="PATH", default="token",
                       help="Dotted path to the token in the login response (default: token).")
 
+    idor = parser.add_argument_group("authorization testing (IDOR / BOLA)")
+    idor.add_argument("--idor", action="store_true",
+                      help="After scanning as the primary identity, replay object reads as a second "
+                           "identity and anonymously, flagging cross-user access. Needs two identities.")
+    idor.add_argument("--header2", action="append", metavar="'Name: value'",
+                      help="Header for the second identity (repeatable).")
+    idor.add_argument("--cookie2", metavar="STRING", help="Cookie for the second identity.")
+    idor.add_argument("--token2", metavar="TOKEN", help="Bearer token for the second identity.")
+    idor.add_argument("--auth-file2", metavar="FILE", help="Auth JSON file for the second identity.")
+
     args = parser.parse_args()
 
     if not args.urls and not sys.stdin.isatty():
@@ -2425,6 +2583,7 @@ if __name__ == "__main__":
         logger.propagate = False
 
     scan_identity = build_identity(args)
+    second_identity = build_second_identity(args) if args.idor else None
 
     main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rate, brute, json_output,
-         args.output, identity=scan_identity)
+         args.output, identity=scan_identity, identity_b=second_identity, idor=args.idor)
